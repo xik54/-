@@ -5,7 +5,7 @@ install.sh 在 systemd Linux VPS 上安装当前稳定版 sing-box，并部署�
 | 入口 | 端口 | 客户端方式 |
 | --- | --- | --- |
 | VLESS + REALITY + XTLS Vision | TCP 443 | 导出完整 sing-box 国内外分流 JSON；同时输出 URI 供兼容客户端手动导入 |
-| Hysteria2 + Gecko | UDP 443 | 输出 hysteria2 URI 和二维码 |
+| Hysteria2 + Salamander | UDP 443 | 输出兼容 Shadowrocket 的 hysteria2 URI 和二维码 |
 | ShadowTLS v3 + Shadowsocks 2022 | TCP 8443 | 导出专用 sing-box JSON；不输出无效的裸 ss URI/二维码 |
 
 默认的 REALITY / ShadowTLS 伪装域名为 www.speedtest.net。--sni 只能传纯域名，例如 www.speedtest.net，不要传 URL、方括号或 Markdown 链接。
@@ -63,6 +63,8 @@ VLESS 不生成二维码：节点 URI 无法容纳整套分流、DNS 与规则�
 默认使用自签名证书，因此 URI 含 insecure=1。若已有受信任证书，可传入：
 
     sudo bash /tmp/sing-box-vps-installer.sh --ip vpn.example.com       --hy2-cert /etc/letsencrypt/live/vpn.example.com/fullchain.pem       --hy2-key /etc/letsencrypt/live/vpn.example.com/privkey.pem       --hy2-sni vpn.example.com
+
+默认使用 `salamander` 混淆，并在二维码 URI 中使用规范的 `:PORT/?` 形式，以优先兼容 Shadowrocket 等 Hysteria2 客户端。`gecko` 是可选的实验性混淆；仅在确认客户端支持时才使用 `--hy2-obfs gecko`。
 
 ### ShadowTLS v3 + Shadowsocks 2022
 

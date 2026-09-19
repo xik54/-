@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # sing-box VPS installer -- systemd-based Debian/Ubuntu, RHEL-family, and Arch Linux.
 # Installs the current stable sing-box build from the upstream installer and creates
-# VLESS+REALITY, Hysteria2+Gecko, and ShadowTLS v3 + Shadowsocks 2022 inbounds.
+# VLESS+REALITY, Hysteria2+Salamander, and ShadowTLS v3 + Shadowsocks 2022 inbounds.
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
@@ -35,7 +35,9 @@ HY2_CERT=''
 HY2_KEY=''
 HY2_SNI=''
 HY2_INSECURE=1
-HY2_OBFS_TYPE='gecko'
+# Salamander is the broadly interoperable Hysteria2 obfuscator for QR imports.
+# Gecko remains available through --hy2-obfs gecko for clients that explicitly support it.
+HY2_OBFS_TYPE='salamander'
 SKIP_SINGBOX_UPDATE=0
 FORCE=0
 ACTION='install'
@@ -122,7 +124,7 @@ Options:
   --hy2-cert PATH     Existing PEM certificate for Hysteria2 (requires --hy2-key and --hy2-sni).
   --hy2-key PATH      Existing PEM private key for Hysteria2.
   --hy2-sni DOMAIN    Certificate hostname used by Hysteria2 clients.
-  --hy2-obfs TYPE     Hysteria2 obfuscation: gecko (default) or salamander.
+  --hy2-obfs TYPE     Hysteria2 obfuscation: salamander (default) or gecko.
   --skip-singbox-update  Keep an already-installed sing-box binary; useful for offline testing only.
   --ss-port PORT      ShadowTLS v3 + Shadowsocks 2022 TCP port (default: 8443).
   --with-warp-upstream  Route proxy clients through a WARP upstream on this VPS.
@@ -799,7 +801,9 @@ print_links() {
   if [[ $HY2_INSECURE == 1 ]]; then hy2_options="insecure=1&$hy2_options"
   else hy2_options="sni=$HY2_SNI&$hy2_options"; fi
   vless_uri="vless://$VLESS_UUID@$uri_host:$VLESS_PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$REALITY_SNI&fp=chrome&pbk=$REALITY_PUBLIC_KEY&sid=$REALITY_SHORT_ID&type=tcp&headerType=none#$APP_NAME-REALITY"
-  hy2_uri="hysteria2://$HY2_PASSWORD@$uri_host:$HY2_PORT?$hy2_options#$APP_NAME-HY2"
+  # Keep the empty path slash before the query: it is the canonical Hysteria2
+  # URI form and is accepted by stricter QR importers such as Shadowrocket.
+  hy2_uri="hysteria2://$HY2_PASSWORD@$uri_host:$HY2_PORT/?$hy2_options#$APP_NAME-HY2"
 
   generate_singbox_cn_bypass_profile
   generate_singbox_shadowtls_ss2022_profile
