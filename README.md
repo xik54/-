@@ -1,123 +1,133 @@
 # sing-box VPS 一键部署
 
-这个目录包含 `install.sh`：在支持的 Linux VPS 上安装当前 stable 版 sing-box，并生成三种接入：
+install.sh 在 systemd Linux VPS 上安装当前稳定版 sing-box，并部署三条独立入口：
 
-- VLESS + REALITY + Vision（TCP 443）
-- Hysteria2 + Gecko 混淆、Chrome QUIC 指纹伪装与 BBR profile（UDP 443）
-- Shadowsocks 2022（TCP/UDP 8443）
-- 可选 VPS 内部 WARP 出站（`--with-warp-upstream`）
+| 入口 | 端口 | 客户端方式 |
+| --- | --- | --- |
+| VLESS + REALITY + XTLS Vision | TCP 443 | 导出完整 sing-box 国内外分流 JSON；同时输出 URI 供兼容客户端手动导入 |
+| Hysteria2 + Gecko | UDP 443 | 输出 hysteria2 URI 和二维码 |
+| ShadowTLS v3 + Shadowsocks 2022 | TCP 8443 | 导出专用 sing-box JSON；不输出无效的裸 ss URI/二维码 |
 
-脚本针对采用 `systemd` 的 Debian/Ubuntu、RHEL/Alma/Rocky/Fedora 和 Arch Linux VPS；不支持 LXC/Docker 等没有运行 systemd 的容器，也不声称支持所有操作系统。它不会启用新的主机防火墙；若 UFW 或 firewalld 已经运行，只会添加所需端口。还会启用内核支持时的 BBR，并安装/启用可用的 fail2ban 服务。
+默认的 REALITY / ShadowTLS 伪装域名为 www.speedtest.net。--sni 只能传纯域名，例如 www.speedtest.net，不要传 URL、方括号或 Markdown 链接。
 
-## 使用
+## 一条命令部署
 
-将脚本传至 VPS 后运行（替换为该 VPS 的公网 IP）：
+在 VPS 的 SSH 终端执行，替换为该 VPS 的公网 IP 或域名：
 
-```bash
-curl -fsSLO https://YOUR-DOMAIN.example/install.sh
-sudo bash install.sh --ip 203.0.113.10
-```
+    curl -fsSL https://raw.githubusercontent.com/xik54/-/main/install.sh -o /tmp/sing-box-vps-installer.sh &&     sudo bash /tmp/sing-box-vps-installer.sh --ip YOUR_VPS_IP
 
-若 443 已被网站占用或云商限制该端口，可换成未占用端口；Shadowsocks 端口必须与前两者不同：
+脚本需要 root/sudo、systemd、出站 HTTPS，以及云厂商安全组中允许：
 
-```bash
-sudo bash install.sh --ip 203.0.113.10 --vless-port 2443 --hy2-port 2443 --ss-port 8443
-```
+- TCP 443（VLESS）
+- UDP 443（Hysteria2）
+- TCP 8443（ShadowTLS + SS2022）
 
-默认使用 sing-box 1.14+ 的 Hysteria2 `gecko` 混淆、`bbr_profile: standard` 和客户端默认的 Chrome QUIC 指纹伪装。若手机客户端过旧、不支持 Gecko，可明确回退到兼容性更高的 Salamander：
+如果系统正在运行 UFW 或 firewalld，脚本会仅添加这些端口；云厂商安全组仍需你自行开放。脚本会启用可用的 BBR，并安装 Fail2Ban 的 SSH 防暴力破解 jail（5 次失败 / 10 分钟，封禁 1 小时）。它不会把普通代理握手错误误判为端口扫描而自动封禁来源 IP。
 
-```bash
-sudo bash install.sh --ip 203.0.113.10 --hy2-obfs salamander
-```
+若使用非默认端口：
 
-脚本默认会把已有 sing-box 更新到当前 stable。仅在离线测试或你已完成版本管控时，才可使用 `--skip-singbox-update` 跳过该更新；生产部署不建议添加此选项。
+    sudo bash /tmp/sing-box-vps-installer.sh       --ip YOUR_VPS_IP --vless-port 2443 --hy2-port 2443 --ss-port 18443
 
-如需让进入 sing-box 的代理流量从 WARP 出站，可启用下面选项。它不会开放原生 WireGuard VPN 入站端口、创建 `wg0`，或改变 VPS 的系统默认路由与 SSH 管理流量；仅作为 sing-box 的上游出口。首次运行会校验下载的开源 `wgcf` 工具并创建一个 WARP WireGuard 配置，凭据仅保存于 `/etc/sing-box/warp/`。WARP 还需要 VPS 能出站访问 UDP `2408`。
+--ss-port 必须不同于 VLESS/Hysteria2 端口，且不能使用脚本保留的内部 SS2022 端口 8444。
 
-```bash
-sudo bash install.sh --ip 203.0.113.10 --with-warp-upstream
-```
+## 节点与客户端配置
 
-## Maintenance
+安装后，敏感凭据仅保存在：
 
-Update only the sing-box core; existing nodes and credentials are preserved:
+    /etc/sing-box/credentials.env
 
-```bash
-sudo bash install.sh --upgrade-core
-```
+VLESS 的 REALITY short_id 会随机生成并同时写入服务端、凭据和导出的客户端配置，避免服务端与客户端 short ID 不一致造成 reality verification failed。
 
-Show status or run a live health check:
+### VLESS：国内直连、国外代理
 
-```bash
-sudo bash install.sh --status
-sudo bash install.sh --health-check
-```
+脚本自动生成：
 
-When WARP is enabled, the installer adds a loopback-only health check on
-`127.0.0.1:18080` and a systemd timer that verifies WARP every 10 minutes.
-View its results with `journalctl -u sing-box-vps-health.service -n 50 --no-pager`.
+    /etc/sing-box/client-profiles/sing-box-vless-cn-bypass.json
 
-默认 Hysteria2 使用自签名 ECDSA 证书，因此导入链接含 `insecure=1`。若已有由可信 CA 签发的域名证书，可改用下列方式；脚本会使用该证书并输出带 SNI、没有 `insecure=1` 的链接：
+该 JSON 包含 TUN、DNS 分流和官方 sing-geosite / sing-geoip 远程规则集：
 
-```bash
-sudo bash install.sh --ip vpn.example.com \
-  --hy2-cert /etc/letsencrypt/live/vpn.example.com/fullchain.pem \
-  --hy2-key /etc/letsencrypt/live/vpn.example.com/privkey.pem \
-  --hy2-sni vpn.example.com
-```
+- 中国大陆域名、国内 IP 与私有网段直连；
+- 其余流量走 VLESS + REALITY；
+- 规则集通过 VLESS 下载，避免首次更新时裸连 GitHub。
 
-如果没有托管下载地址，可从本机复制：
+导入到当前 sing-box 客户端并授予 VPN/TUN 权限。首次启动需要 VLESS 本身能连接，以下载远程规则集；如果报出 reality verification failed，优先核对 IP、SNI、UUID、公钥和 short_id 是否来自同一次安装。
 
-```bash
-scp ./install.sh root@YOUR_VPS:/root/
-ssh root@YOUR_VPS 'bash /root/install.sh --ip YOUR_VPS_IP'
-```
+VLESS 不生成二维码：节点 URI 无法容纳整套分流、DNS 与规则集配置。脚本仍会在终端输出 VLESS URI，供支持 Reality URI 的其它客户端手动导入。
 
-完成后脚本会在终端输出导入链接，且将仅限 root 读取的原始凭据写入 `/etc/sing-box/credentials.env`。请同时在云服务商安全组/防火墙中开放 TCP+UDP `443` 与 TCP+UDP `8443`。
+### Hysteria2
 
-脚本还会安装 `qrencode` 并生成标准导入二维码。终端会显示二维码，PNG 文件保存在仅 root 可读的 `/etc/sing-box/qr/`：`vless-reality.png`、`hysteria2.png`、`shadowsocks-2022.png`。可安全复制图片至手机，再用小火箭、sing-box 等客户端的“扫描二维码/从相册导入”功能导入；二维码等同密码，切勿公开分享。
+脚本输出 hysteria2 URI，并生成唯一的通用二维码：
 
-例如从本机安全复制二维码：
+    /etc/sing-box/qr/hysteria2.png
 
-```bash
-scp root@你的VPS:/etc/sing-box/qr/vless-reality.png .
-```
+默认使用自签名证书，因此 URI 含 insecure=1。若已有受信任证书，可传入：
 
-## 国内外分流（sing-box 客户端）
+    sudo bash /tmp/sing-box-vps-installer.sh --ip vpn.example.com       --hy2-cert /etc/letsencrypt/live/vpn.example.com/fullchain.pem       --hy2-key /etc/letsencrypt/live/vpn.example.com/privkey.pem       --hy2-sni vpn.example.com
 
-单节点二维码只能保存节点连接参数，不能通用地保存路由规则。脚本会额外生成 `/etc/sing-box/client-profiles/sing-box-vless-cn-bypass.json`：大陆域名、国内 IP 和私有网段直连，其余流量通过 VLESS+REALITY 代理；同时使用官方 `sing-geosite` / `sing-geoip` 远程规则集及 DNS 分流。
+### ShadowTLS v3 + Shadowsocks 2022
 
-```bash
-scp root@你的VPS:/etc/sing-box/client-profiles/sing-box-vless-cn-bypass.json .
-```
+Shadowsocks 2022 只在回环地址的内部端口监听，公网 TCP 8443 由 ShadowTLS v3 接收并转发给它。因此裸 ss URI 缺少 ShadowTLS 认证层，不能使用，脚本不会生成这种误导性二维码。
 
-将该 JSON 导入当前 sing-box 客户端并授予 VPN/TUN 权限。首次使用需要客户端能够下载规则集；规则集定义和更新由上游维护。小火箭请扫码导入单节点后，在其应用内单独设置规则；它不能直接导入此 sing-box JSON 作为二维码。
+自动生成的专用 sing-box 配置：
 
-## 在隔离虚拟机验证
+    /etc/sing-box/client-profiles/sing-box-shadowtls-ss2022.json
 
-不需要、也不应在你的本机执行安装。将整个目录复制到一台可丢弃的 Linux 虚拟机或测试 VPS，在虚拟机内依次运行：
+该路径要求使用支持 ShadowTLS v3 的当前 sing-box 客户端。它是兼容性与伪装层的取舍：Shadowrocket 等只识别普通 Shadowsocks URI 的客户端不能使用这一条；请使用 VLESS 或 Hysteria2。
 
-```bash
-sudo bash install.sh --ip VM的公网IP
-sudo bash vm-smoke-test.sh
-```
+从电脑安全下载配置示例：
 
-`vm-smoke-test.sh` 是只读检查：验证 sing-box 配置、systemd 服务状态及 TCP/UDP 443、8443 监听。要验证真实连通性，使用另一台网络中的客户端导入安装输出的三条 URI。若使用自定义端口，请将相同端口值传给验证脚本：
+    scp root@YOUR_VPS:/etc/sing-box/client-profiles/sing-box-vless-cn-bypass.json .
+    scp root@YOUR_VPS:/etc/sing-box/client-profiles/sing-box-shadowtls-ss2022.json .
 
-```bash
-sudo bash vm-smoke-test.sh --vless-port 2443 --hy2-port 2443 --ss-port 8443
-```
+配置文件和二维码都含凭据，不要放进公开仓库或聊天记录。
 
-## 重要说明
+## WARP 作为 VPS 出站
 
-- `--sni` 是 REALITY 的伪装握手域名。默认 `www.cloudflare.com`；如替换，使用一个从 VPS 可访问、正常提供 TLS/443 的域名。
-- Hysteria2 默认使用自签名证书，所以链接中带 `insecure=1`。若你有自己的域名和公开可信证书，可把配置中的证书路径换成证书文件，并移除客户端的 `insecure=1`。
-- 脚本拒绝覆盖已有 `/etc/sing-box/config.json`；明确需要重新生成时，再增加 `--force`，旧配置会按时间戳备份。
-- 使用前确认当地法律、云商条款和网络服务条款允许你的用途。
+可选 WARP 只作为 sing-box 内部的上游出口；不会创建 WireGuard 入站、wg0、新的 VPN 端口，也不会改变 VPS 默认路由或 SSH 管理流量：
 
-官方资料：[sing-box 安装](https://sing-box.sagernet.org/installation/package-manager/)、[VLESS 入站](https://sing-box.sagernet.org/configuration/inbound/vless/)、[Hysteria2 入站](https://sing-box.sagernet.org/configuration/inbound/hysteria2/)。
+    sudo bash /tmp/sing-box-vps-installer.sh --ip YOUR_VPS_IP --with-warp-upstream
 
-## 已验证环境
+首次免费注册依赖 Cloudflare 的服务。如果 wgcf 返回 429 Too Many Requests，安装会在停止已有 sing-box 服务之前退出；稍后再试，或导入你自己的 WARP 配置：
 
-2026-09-16 已在独立 Ubuntu 24.04.3 LTS WSL2 环境验证：使用保留测试地址 `198.18.0.1` 和端口 `2443/2443/18443` 完成安装；`sing-box check` 成功，systemd 服务为 active，VLESS TCP、Hysteria2 UDP、Shadowsocks TCP/UDP 监听均存在，三张 PNG 二维码已生成且权限为 `0600`。这不替代真实 VPS 的云安全组和跨网络客户端连通性验证。
+    sudo bash /tmp/sing-box-vps-installer.sh       --ip YOUR_VPS_IP --with-warp-upstream       --warp-profile /root/wgcf-profile.conf
 
+开启后可检查：
+
+    sudo bash /tmp/sing-box-vps-installer.sh --status
+    sudo bash /tmp/sing-box-vps-installer.sh --health-check
+    journalctl -u sing-box-vps-health.service -n 50 --no-pager
+
+健康检查通过 loopback-only 的 127.0.0.1:18080 请求 Cloudflare trace，确认返回 warp=on 或 warp=plus。
+
+## 维护
+
+重新生成客户端 JSON，不改变服务器节点或凭据：
+
+    sudo bash /tmp/sing-box-vps-installer.sh --export-client-profile
+
+仅升级内核，不重建节点：
+
+    sudo bash /tmp/sing-box-vps-installer.sh --upgrade-core
+
+明确需要重新生成所有节点时，才使用 --force。脚本会制作时间戳备份；如果 --force 过程中下载、配置校验或启动失败，会恢复之前的配置、凭据与服务。
+
+    sudo bash /tmp/sing-box-vps-installer.sh --force --ip YOUR_VPS_IP
+
+## 隔离 Ubuntu 验证
+
+只在可丢弃的 Linux 虚拟机/测试 VPS 中运行，不在 Windows 主机上安装：
+
+    sudo bash install.sh --ip VM_PUBLIC_IP
+    sudo bash vm-smoke-test.sh
+
+烟雾测试为只读检查：验证服务、服务端配置、两份客户端 JSON、Hysteria2 二维码，以及 VLESS TCP、Hysteria2 UDP、ShadowTLS TCP 和内部 SS2022 TCP 监听。
+
+    sudo bash vm-smoke-test.sh       --vless-port 2443 --hy2-port 2443 --ss-port 18443
+
+2026-09-19 已在独立 Ubuntu WSL2 测试环境以 sing-box 1.14.1 完成配置、服务、监听和客户端 JSON 内核校验。该结果不替代真实 VPS 的云安全组与跨网络客户端连通性测试。
+
+## 重要边界
+
+- 伪装与混淆不能保证绕过任何网络审查、探测或服务风控；请遵守当地法律、云厂商条款和服务条款。
+- WARP 的可用性、出口区域和 IP 由 Cloudflare 决定，不能保证某个 AI 或网站一定可用。
+- 远程规则集由上游维护；规则内容或 URL 变化时应使用 --export-client-profile 重新生成并检查客户端日志。

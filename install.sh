@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # sing-box VPS installer -- systemd-based Debian/Ubuntu, RHEL-family, and Arch Linux.
 # Installs the current stable sing-box build from the upstream installer and creates
-# VLESS+REALITY, Hysteria2+Gecko, and Shadowsocks 2022 inbounds.
+# VLESS+REALITY, Hysteria2+Gecko, and ShadowTLS v3 + Shadowsocks 2022 inbounds.
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
@@ -27,8 +27,10 @@ WGCF_BIN="$WARP_DIR/wgcf"
 VLESS_PORT=443
 HY2_PORT=443
 SS_PORT=8443
+SS_INNER_PORT=8444
 VPS_IP=''
-SNI='www.cloudflare.com'
+SNI='www.speedtest.net'
+REALITY_SHORT_ID=''
 HY2_CERT=''
 HY2_KEY=''
 HY2_SNI=''
@@ -37,19 +39,84 @@ HY2_OBFS_TYPE='gecko'
 SKIP_SINGBOX_UPDATE=0
 FORCE=0
 ACTION='install'
+ROLLBACK_ENABLED=0
+ROLLBACK_CONFIG_BACKUP=''
+ROLLBACK_STATE_BACKUP=''
+ROLLBACK_SERVICE_BACKUP=''
+ROLLBACK_SERVICE_FILE_EXISTED=0
 
 color() { printf '\033[%sm%s\033[0m\n' "$1" "$2"; }
 info() { color '1;34' "[INFO] $*"; }
 warn() { color '1;33' "[WARN] $*" >&2; }
 die() { color '1;31' "[ERROR] $*" >&2; exit 1; }
 
+restore_previous_service_on_failure() {
+  local exit_status=$?
+  local backup_dir=''
+  if (( exit_status != 0 && ROLLBACK_ENABLED )); then
+    warn 'Installation did not complete; restoring the prior sing-box configuration and service.'
+    if [[ -n $ROLLBACK_CONFIG_BACKUP && -f $ROLLBACK_CONFIG_BACKUP ]]; then
+      cp -af "$ROLLBACK_CONFIG_BACKUP" "$CONFIG_FILE" || warn 'Could not restore the prior sing-box configuration.'
+      backup_dir="$(dirname "$ROLLBACK_CONFIG_BACKUP")"
+    fi
+    if [[ -n $ROLLBACK_STATE_BACKUP && -f $ROLLBACK_STATE_BACKUP ]]; then
+      cp -af "$ROLLBACK_STATE_BACKUP" "$STATE_FILE" || warn 'Could not restore the prior credentials file.'
+    else
+      rm -f "$STATE_FILE"
+    fi
+    if [[ -n $ROLLBACK_SERVICE_BACKUP && -f $ROLLBACK_SERVICE_BACKUP ]]; then
+      cp -af "$ROLLBACK_SERVICE_BACKUP" "$SERVICE_FILE" || warn 'Could not restore the prior sing-box service unit.'
+    elif (( ! ROLLBACK_SERVICE_FILE_EXISTED )); then
+      rm -f "$SERVICE_FILE"
+    fi
+    systemctl daemon-reload || true
+    systemctl restart sing-box || warn 'Could not restart the prior sing-box service automatically.'
+    [[ -z $backup_dir ]] || { rm -f "$ROLLBACK_CONFIG_BACKUP" "$ROLLBACK_STATE_BACKUP" "$ROLLBACK_SERVICE_BACKUP"; rmdir "$backup_dir" 2>/dev/null || true; }
+  fi
+  trap - EXIT
+  exit "$exit_status"
+}
+trap restore_previous_service_on_failure EXIT
+
+begin_force_rollback() {
+  local backup_dir
+  [[ -e $CONFIG_FILE && $FORCE -eq 1 ]] || return 0
+  backup_dir="$(mktemp -d "$CONFIG_DIR/.rollback.XXXXXX")"
+  cp -a "$CONFIG_FILE" "$backup_dir/config.json"
+  if [[ -e $STATE_FILE ]]; then cp -a "$STATE_FILE" "$backup_dir/credentials.env"; fi
+  ROLLBACK_CONFIG_BACKUP="$backup_dir/config.json"
+  ROLLBACK_STATE_BACKUP="$backup_dir/credentials.env"
+  ROLLBACK_SERVICE_BACKUP="$backup_dir/sing-box.service"
+  if [[ -e $SERVICE_FILE ]]; then
+    cp -a "$SERVICE_FILE" "$ROLLBACK_SERVICE_BACKUP"
+    ROLLBACK_SERVICE_FILE_EXISTED=1
+  else
+    ROLLBACK_SERVICE_FILE_EXISTED=0
+  fi
+  ROLLBACK_ENABLED=1
+  systemctl stop sing-box 2>/dev/null || true
+}
+
+commit_force_rollback() {
+  local backup_dir=''
+  if [[ -n $ROLLBACK_CONFIG_BACKUP ]]; then backup_dir="$(dirname "$ROLLBACK_CONFIG_BACKUP")"; fi
+  ROLLBACK_ENABLED=0
+  rm -f "$ROLLBACK_CONFIG_BACKUP" "$ROLLBACK_STATE_BACKUP" "$ROLLBACK_SERVICE_BACKUP"
+  [[ -z $backup_dir ]] || rmdir "$backup_dir" 2>/dev/null || true
+  ROLLBACK_CONFIG_BACKUP=''
+  ROLLBACK_STATE_BACKUP=''
+  ROLLBACK_SERVICE_BACKUP=''
+  ROLLBACK_SERVICE_FILE_EXISTED=0
+ROLLBACK_SERVICE_BACKUP=''
+ROLLBACK_SERVICE_FILE_EXISTED=0
+}
 usage() {
   cat <<'EOF'
 Usage: sudo bash install.sh [options]
 
 Options:
   --ip ADDRESS        Public IPv4/IPv6 or DNS name placed into client links.
-  --sni DOMAIN        REALITY camouflage domain (default: www.cloudflare.com).
+  --sni DOMAIN        REALITY/ShadowTLS camouflage domain (default: www.speedtest.net).
   --vless-port PORT   VLESS+REALITY TCP port (default: 443).
   --hy2-port PORT     Hysteria2 UDP port (default: 443).
   --hy2-cert PATH     Existing PEM certificate for Hysteria2 (requires --hy2-key and --hy2-sni).
@@ -57,7 +124,7 @@ Options:
   --hy2-sni DOMAIN    Certificate hostname used by Hysteria2 clients.
   --hy2-obfs TYPE     Hysteria2 obfuscation: gecko (default) or salamander.
   --skip-singbox-update  Keep an already-installed sing-box binary; useful for offline testing only.
-  --ss-port PORT      Shadowsocks 2022 TCP+UDP port (default: 8443).
+  --ss-port PORT      ShadowTLS v3 + Shadowsocks 2022 TCP port (default: 8443).
   --with-warp-upstream  Route proxy clients through a WARP upstream on this VPS.
                       This does not alter the VPS default route or SSH traffic.
   --warp-profile PATH Import an existing WARP WireGuard profile instead of creating
@@ -65,12 +132,13 @@ Options:
   --upgrade-core       Update sing-box and restart it without replacing nodes or credentials.
   --status             Show service, configuration, and WARP monitor status.
   --health-check       Verify the configuration, service, and enabled WARP upstream.
+  --export-client-profile  Rebuild sing-box client JSON files only; server nodes stay unchanged.
   --force             Replace an existing /etc/sing-box/config.json (a timestamped
                       backup is still made).
   -h, --help          Show this help.
 
 Requirements: a Linux VPS with a public address, root/sudo, outbound HTTPS access,
-and inbound TCP+UDP 443 plus TCP+UDP 8443 permitted at the provider firewall.
+and inbound TCP 443, UDP 443, and TCP 8443 permitted at the provider firewall.
 The optional WARP upstream also needs outbound UDP 2408; it is not an inbound port.
 EOF
 }
@@ -92,6 +160,7 @@ while (($#)); do
     --upgrade-core) ACTION='upgrade-core'; shift ;;
     --status) ACTION='status'; shift ;;
     --health-check) ACTION='health-check'; shift ;;
+    --export-client-profile) ACTION='export-client-profile'; shift ;;
     --force) FORCE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown option: $1" ;;
@@ -295,24 +364,23 @@ check_ports() {
   [[ -z $tcp ]] || die "TCP $VLESS_PORT is already in use. Free it or change the script before proceeding."
   [[ -z $udp ]] || die "UDP $HY2_PORT is already in use. Free it or change the script before proceeding."
   [[ -z "$(ss -H -ltn "sport = :$SS_PORT" || true)" ]] || die "TCP $SS_PORT is already in use."
-  [[ -z "$(ss -H -lun "sport = :$SS_PORT" || true)" ]] || die "UDP $SS_PORT is already in use."
+  [[ -z "$(ss -H -ltn "sport = :$SS_INNER_PORT" || true)" ]] || die "TCP $SS_INNER_PORT is already in use; reserved for internal SS2022."
   if (( WITH_WARP_UPSTREAM )); then
     [[ -z "$(ss -H -ltn "sport = :$WARP_HEALTH_PORT" || true)" ]] || die "TCP $WARP_HEALTH_PORT is already in use; it is reserved for the local WARP health check."
   fi
 }
 
 open_firewall_if_active() {
-  local provider_ports="TCP $VLESS_PORT, UDP $HY2_PORT, TCP+UDP $SS_PORT"
+  local provider_ports="TCP $VLESS_PORT, UDP $HY2_PORT, TCP $SS_PORT"
   if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
     info 'Opening required ports in active UFW'
     ufw allow "$VLESS_PORT/tcp"; ufw allow "$HY2_PORT/udp"
-    ufw allow "$SS_PORT/tcp"; ufw allow "$SS_PORT/udp"
+    ufw allow "$SS_PORT/tcp"
   elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
     info 'Opening required ports in active firewalld'
     firewall-cmd --permanent --add-port="$VLESS_PORT/tcp"
     firewall-cmd --permanent --add-port="$HY2_PORT/udp"
     firewall-cmd --permanent --add-port="$SS_PORT/tcp"
-    firewall-cmd --permanent --add-port="$SS_PORT/udp"
     firewall-cmd --reload
   else
     warn "No active host firewall was changed. Open $provider_ports in your VPS provider firewall/security group."
@@ -332,15 +400,23 @@ EOF
   fi
 }
 
-urlencode_ss_password() {
-  local value="$1"
-  value=${value//'%'/'%25'}; value=${value//'+'/'%2B'}; value=${value//'/'/'%2F'}; value=${value//'='/'%3D'}
-  printf '%s' "$value"
+configure_fail2ban() {
+  command -v fail2ban-client >/dev/null || { warn 'fail2ban is unavailable; SSH brute-force protection was not configured.'; return 0; }
+  install -d -m 755 /etc/fail2ban/jail.d
+  cat > /etc/fail2ban/jail.d/sshd-local.conf <<'EOF'
+[sshd]
+enabled = true
+backend = systemd
+maxretry = 5
+findtime = 10m
+bantime = 1h
+EOF
+  systemctl enable --now fail2ban || warn 'fail2ban could not be started.'
+  fail2ban-client status sshd >/dev/null 2>&1 && info 'Fail2Ban SSH jail is active.' || warn 'Fail2Ban started but the SSH jail is unavailable.'
 }
-
 write_config() {
   local timestamp private_key public_key reality_pair candidate_file
-  local uuid hy2_password hy2_obfs hy2_obfs_options ss_password cert_path key_path
+  local uuid hy2_password hy2_obfs hy2_obfs_options ss_password shadowtls_password cert_path key_path reality_short_id
   local warp_sections warp_health_inbound route_section
   timestamp="$(date +%Y%m%d%H%M%S)"
   if [[ -e $CONFIG_FILE ]]; then
@@ -372,6 +448,8 @@ write_config() {
   public_key="$(printf '%s\n' "$reality_pair" | sed -n 's/.*PublicKey:[[:space:]]*//p' | head -n1)"
   [[ -n $private_key && -n $public_key ]] || die 'Could not parse sing-box REALITY keypair output.'
   uuid="$(cat /proc/sys/kernel/random/uuid)"
+  reality_short_id="$(openssl rand -hex 4)"
+  REALITY_SHORT_ID="$reality_short_id"
   hy2_password="$(openssl rand -hex 32)"
   hy2_obfs="$(openssl rand -hex 24)"
   hy2_obfs_options=''
@@ -379,6 +457,7 @@ write_config() {
     hy2_obfs_options=', "min_packet_size": 512, "max_packet_size": 1200'
   fi
   ss_password="$(openssl rand -base64 32 | tr -d '\n')"
+  shadowtls_password="$(openssl rand -base64 24 | tr -d '\n')"
 
   warp_sections=''
   warp_health_inbound=''
@@ -436,11 +515,12 @@ $warp_health_inbound
       "users": [{ "name": "main", "uuid": "$uuid", "flow": "xtls-rprx-vision" }],
       "tls": {
         "enabled": true,
+        "server_name": "$SNI",
         "reality": {
           "enabled": true,
           "handshake": { "server": "$SNI", "server_port": 443 },
           "private_key": "$private_key",
-          "short_id": [""]
+          "short_id": ["$reality_short_id"]
         }
       }
     },
@@ -462,10 +542,22 @@ $warp_health_inbound
       "masquerade": { "type": "string", "status_code": 404, "content": "Not Found" }
     },
     {
-      "type": "shadowsocks",
-      "tag": "shadowsocks-2022",
+      "type": "shadowtls",
+      "tag": "shadowtls-v3",
       "listen": "::",
       "listen_port": $SS_PORT,
+      "version": 3,
+      "users": [{ "name": "main", "password": "$shadowtls_password" }],
+      "handshake": { "server": "$SNI", "server_port": 443 },
+      "strict_mode": true,
+      "detour": "shadowsocks-2022"
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "shadowsocks-2022",
+      "listen": "127.0.0.1",
+      "listen_port": $SS_INNER_PORT,
+      "network": "tcp",
       "method": "2022-blake3-aes-256-gcm",
       "password": "$ss_password"
     }
@@ -484,12 +576,18 @@ VPS_IP='$VPS_IP'
 REALITY_SNI='$SNI'
 VLESS_UUID='$uuid'
 REALITY_PUBLIC_KEY='$public_key'
+REALITY_SHORT_ID='$reality_short_id'
+VLESS_PORT='$VLESS_PORT'
+HY2_PORT='$HY2_PORT'
+SS_PORT='$SS_PORT'
+SS_INNER_PORT='$SS_INNER_PORT'
 HY2_PASSWORD='$hy2_password'
 HY2_OBFS_PASSWORD='$hy2_obfs'
 HY2_OBFS_TYPE='$HY2_OBFS_TYPE'
 HY2_SNI='$HY2_SNI'
 HY2_INSECURE='$HY2_INSECURE'
 SS2022_PASSWORD='$ss_password'
+SHADOWTLS_PASSWORD='$shadowtls_password'
 WARP_UPSTREAM_ENABLED='$WITH_WARP_UPSTREAM'
 WARP_PROFILE='$WARP_PROFILE'
 EOF
@@ -520,28 +618,19 @@ EOF
 }
 
 generate_qr_codes() {
-  local vless_uri="$1" hy2_uri="$2" ss_uri="$3"
-  command -v qrencode >/dev/null || { warn 'qrencode is unavailable; no QR images were created.'; return 0; }
+  local hy2_uri="$1"
+  command -v qrencode >/dev/null || { warn 'qrencode is unavailable; no Hysteria2 QR image was created.'; return 0; }
   install -d -m 700 "$QR_DIR"
-  qrencode -l L -s 8 -o "$QR_DIR/vless-reality.png" "$vless_uri" || { warn 'Could not create VLESS QR image.'; return 0; }
   qrencode -l L -s 8 -o "$QR_DIR/hysteria2.png" "$hy2_uri" || { warn 'Could not create Hysteria2 QR image.'; return 0; }
-  qrencode -l L -s 8 -o "$QR_DIR/shadowsocks-2022.png" "$ss_uri" || { warn 'Could not create Shadowsocks QR image.'; return 0; }
-  chmod 600 "$QR_DIR"/*.png
+  chmod 600 "$QR_DIR/hysteria2.png"
   cat <<EOF
 
-QR PNG files (copy securely; they contain credentials):
-  $QR_DIR/vless-reality.png
+Hysteria2 QR PNG (copy securely; it contains credentials):
   $QR_DIR/hysteria2.png
-  $QR_DIR/shadowsocks-2022.png
 EOF
-  printf '\nTerminal QR: VLESS + REALITY\n'
-  qrencode -t ANSIUTF8 "$vless_uri" || warn 'Could not render terminal VLESS QR.'
   printf '\nTerminal QR: Hysteria2\n'
   qrencode -t ANSIUTF8 "$hy2_uri" || warn 'Could not render terminal Hysteria2 QR.'
-  printf '\nTerminal QR: Shadowsocks 2022\n'
-  qrencode -t ANSIUTF8 "$ss_uri" || warn 'Could not render terminal Shadowsocks QR.'
 }
-
 generate_singbox_cn_bypass_profile() {
   local profile_path="$CLIENT_DIR/sing-box-vless-cn-bypass.json"
   install -d -m 700 "$CLIENT_DIR"
@@ -550,20 +639,19 @@ generate_singbox_cn_bypass_profile() {
   "log": { "level": "warn", "timestamp": true },
   "dns": {
     "servers": [
-      { "tag": "google", "type": "tls", "server": "8.8.8.8" },
-      { "tag": "local", "type": "https", "server": "223.5.5.5" }
+      {
+        "tag": "google", "type": "tls", "server": "8.8.8.8", "server_port": 853,
+        "tls": { "enabled": true, "server_name": "dns.google" }, "detour": "proxy"
+      },
+      {
+        "tag": "local", "type": "https", "server": "223.5.5.5", "server_port": 443,
+        "tls": { "enabled": true, "server_name": "dns.alidns.com" }
+      }
     ],
     "rules": [
-      { "rule_set": "geosite-geolocation-cn", "action": "route", "server": "local" },
-      {
-        "type": "logical", "mode": "and",
-        "rules": [
-          { "rule_set": "geosite-geolocation-!cn", "invert": true },
-          { "rule_set": "geoip-cn" }
-        ],
-        "action": "route", "server": "google", "client_subnet": "114.114.114.114/24"
-      }
-    ]
+      { "rule_set": "geosite-geolocation-cn", "action": "route", "server": "local" }
+    ],
+    "final": "google"
   },
   "inbounds": [
     {
@@ -576,17 +664,22 @@ generate_singbox_cn_bypass_profile() {
     {
       "type": "vless", "tag": "proxy",
       "server": "$VPS_IP", "server_port": $VLESS_PORT,
-      "uuid": "$VLESS_UUID", "flow": "xtls-rprx-vision",
+      "uuid": "$VLESS_UUID", "flow": "xtls-rprx-vision", "network": "tcp",
       "tls": {
         "enabled": true, "server_name": "$REALITY_SNI",
         "utls": { "enabled": true, "fingerprint": "chrome" },
-        "reality": { "enabled": true, "public_key": "$REALITY_PUBLIC_KEY" }
+        "reality": {
+          "enabled": true, "public_key": "$REALITY_PUBLIC_KEY",
+          "short_id": "$REALITY_SHORT_ID"
+        }
       }
     },
     { "type": "direct", "tag": "direct" }
   ],
+  "http_clients": [{ "tag": "proxy-download", "detour": "proxy" }],
   "route": {
     "default_domain_resolver": "local",
+    "default_http_client": "proxy-download",
     "auto_detect_interface": true,
     "rules": [
       { "action": "sniff" },
@@ -609,15 +702,18 @@ generate_singbox_cn_bypass_profile() {
     "rule_set": [
       {
         "type": "remote", "tag": "geosite-geolocation-cn", "format": "binary",
-        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-cn.srs"
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-cn.srs",
+        "http_client": "proxy-download", "update_interval": "7d"
       },
       {
         "type": "remote", "tag": "geosite-geolocation-!cn", "format": "binary",
-        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-!cn.srs"
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-!cn.srs",
+        "http_client": "proxy-download", "update_interval": "7d"
       },
       {
         "type": "remote", "tag": "geoip-cn", "format": "binary",
-        "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs"
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
+        "http_client": "proxy-download", "update_interval": "7d"
       }
     ],
     "final": "proxy"
@@ -626,46 +722,119 @@ generate_singbox_cn_bypass_profile() {
 }
 EOF
   chmod 600 "$profile_path"
-  sing-box check -c "$profile_path" || die 'Generated Chinese-bypass client profile failed sing-box validation.'
-  printf '\nSing-box China-bypass client profile (contains credentials):\n  %s\n' "$profile_path"
+  sing-box check -c "$profile_path" || die 'Generated VLESS China-bypass client profile failed sing-box validation.'
 }
 
+generate_singbox_shadowtls_ss2022_profile() {
+  local profile_path="$CLIENT_DIR/sing-box-shadowtls-ss2022.json"
+  if ! [[ -v SHADOWTLS_PASSWORD ]] || [[ -z "$SHADOWTLS_PASSWORD" ]]; then
+    warn 'No ShadowTLS credential was found; skip the ShadowTLS + Shadowsocks client profile. Reinstall with --force to create it.'
+    return 0
+  fi
+  install -d -m 700 "$CLIENT_DIR"
+  cat > "$profile_path" <<EOF
+{
+  "log": { "level": "warn", "timestamp": true },
+  "dns": {
+    "servers": [
+      {
+        "tag": "remote", "type": "tls", "server": "1.1.1.1", "server_port": 853,
+        "tls": { "enabled": true, "server_name": "cloudflare-dns.com" },
+        "detour": "ss2022-over-shadowtls"
+      }
+    ],
+    "final": "remote"
+  },
+  "inbounds": [
+    {
+      "type": "tun", "tag": "tun-in",
+      "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+      "auto_route": true, "strict_route": true
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "shadowsocks", "tag": "ss2022-over-shadowtls",
+      "server": "$VPS_IP", "server_port": $SS_PORT,
+      "method": "2022-blake3-aes-256-gcm", "password": "$SS2022_PASSWORD",
+      "network": "tcp", "detour": "shadowtls"
+    },
+    {
+      "type": "shadowtls", "tag": "shadowtls",
+      "server": "$VPS_IP", "server_port": $SS_PORT,
+      "version": 3, "password": "$SHADOWTLS_PASSWORD",
+      "tls": {
+        "enabled": true, "server_name": "$REALITY_SNI",
+        "utls": { "enabled": true, "fingerprint": "chrome" }
+      }
+    },
+    { "type": "direct", "tag": "direct" }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "rules": [
+      { "action": "sniff" },
+      {
+        "type": "logical", "mode": "or",
+        "rules": [{ "protocol": "dns" }, { "port": 53 }],
+        "action": "hijack-dns"
+      },
+      { "ip_is_private": true, "action": "route", "outbound": "direct" }
+    ],
+    "final": "ss2022-over-shadowtls"
+  }
+}
+EOF
+  chmod 600 "$profile_path"
+  sing-box check -c "$profile_path" || die 'Generated ShadowTLS + Shadowsocks client profile failed sing-box validation.'
+}
 print_links() {
   # shellcheck disable=SC1090
   source "$STATE_FILE"
-  local ss_encoded uri_host hy2_options vless_uri hy2_uri ss_uri
-  ss_encoded="$(urlencode_ss_password "$SS2022_PASSWORD")"
+  local uri_host hy2_options vless_uri hy2_uri
   uri_host="$VPS_IP"
   # URI authorities require brackets around an IPv6 literal.
   [[ $uri_host == *:* ]] && uri_host="[$uri_host]"
   hy2_options="obfs=$HY2_OBFS_TYPE&obfs-password=$HY2_OBFS_PASSWORD"
   if [[ $HY2_INSECURE == 1 ]]; then hy2_options="insecure=1&$hy2_options"
   else hy2_options="sni=$HY2_SNI&$hy2_options"; fi
-  vless_uri="vless://$VLESS_UUID@$uri_host:$VLESS_PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$REALITY_SNI&fp=chrome&pbk=$REALITY_PUBLIC_KEY&type=tcp&headerType=none#$APP_NAME-REALITY"
+  vless_uri="vless://$VLESS_UUID@$uri_host:$VLESS_PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$REALITY_SNI&fp=chrome&pbk=$REALITY_PUBLIC_KEY&sid=$REALITY_SHORT_ID&type=tcp&headerType=none#$APP_NAME-REALITY"
   hy2_uri="hysteria2://$HY2_PASSWORD@$uri_host:$HY2_PORT?$hy2_options#$APP_NAME-HY2"
-  ss_uri="ss://2022-blake3-aes-256-gcm:$ss_encoded@$uri_host:$SS_PORT#$APP_NAME-SS2022"
+
+  generate_singbox_cn_bypass_profile
+  generate_singbox_shadowtls_ss2022_profile
+
   cat <<EOF
 
 =================================================================
-Installed and validated.  Credentials were saved at: $STATE_FILE
+Installed and validated. Credentials were saved at: $STATE_FILE
 =================================================================
 
 VLESS + REALITY (TCP $VLESS_PORT; Vision):
 $vless_uri
+Use $CLIENT_DIR/sing-box-vless-cn-bypass.json in sing-box. No VLESS QR is
+generated because a URL cannot carry the China-direct routing rules.
 
 Hysteria2 + $HY2_OBFS_TYPE (UDP $HY2_PORT):
 $hy2_uri
 
-Shadowsocks 2022 (TCP+UDP $SS_PORT):
-$ss_uri
+ShadowTLS v3 + Shadowsocks 2022 (TCP $SS_PORT):
+Use $CLIENT_DIR/sing-box-shadowtls-ss2022.json in a current sing-box client.
+A normal ss:// URI and QR are intentionally not printed: they cannot represent
+the required ShadowTLS v3 authentication layer and would be unusable.
+
+Client profiles (each contains credentials; copy securely):
+  $CLIENT_DIR/sing-box-vless-cn-bypass.json
+  $CLIENT_DIR/sing-box-shadowtls-ss2022.json
 
 Operations:
   systemctl status sing-box
   journalctl -u sing-box -f
   sing-box check -c $CONFIG_FILE
+  sudo bash install.sh --export-client-profile
 
 Important: provider-level firewalls/security groups are outside this VPS. Open
-TCP $VLESS_PORT, UDP $HY2_PORT, and TCP+UDP $SS_PORT there. Keep $STATE_FILE private.
+TCP $VLESS_PORT, UDP $HY2_PORT, and TCP $SS_PORT there. Keep $STATE_FILE private.
 EOF
   if (( WITH_WARP_UPSTREAM )); then
     cat <<EOF
@@ -677,10 +846,22 @@ WARP is an upstream network service, so availability and the observed egress IP
 are controlled by Cloudflare and may change.
 EOF
   fi
-  generate_singbox_cn_bypass_profile
-  generate_qr_codes "$vless_uri" "$hy2_uri" "$ss_uri"
+  generate_qr_codes "$hy2_uri"
 }
-
+export_client_profile() {
+  [[ -r $STATE_FILE ]] || die "Credentials not found: $STATE_FILE"
+  # shellcheck disable=SC1090
+  source "$STATE_FILE"
+  [[ -n ${VLESS_UUID:-} && -n ${REALITY_PUBLIC_KEY:-} && -n ${REALITY_SNI:-} && -n ${VPS_IP:-} ]] \
+    || die 'The saved VLESS credentials are incomplete.'
+  [[ -n ${REALITY_SHORT_ID:-} ]] \
+    || die 'The saved deployment predates REALITY short-id support. Reinstall with --force to generate a matched server and client configuration.'
+  VLESS_PORT="${VLESS_PORT:-443}"
+  SS_PORT="${SS_PORT:-8443}"
+  generate_singbox_cn_bypass_profile
+  generate_singbox_shadowtls_ss2022_profile
+  info "Client profiles rebuilt without changing server nodes: $CLIENT_DIR"
+}
 warp_is_configured() {
   [[ -f $STATE_FILE ]] && grep -q "^WARP_UPSTREAM_ENABLED='1'" "$STATE_FILE"
 }
@@ -777,7 +958,8 @@ main() {
   elif [[ -n $HY2_SNI ]]; then
     die '--hy2-sni is only used together with --hy2-cert and --hy2-key.'
   fi
-  [[ $SS_PORT != "$VLESS_PORT" && $SS_PORT != "$HY2_PORT" ]] || die 'The Shadowsocks port must differ from both VLESS and Hysteria2 ports.'
+  [[ $SS_PORT != "$VLESS_PORT" && $SS_PORT != "$HY2_PORT" ]] || die 'The ShadowTLS port must differ from both VLESS and Hysteria2 ports.'
+  [[ $SS_PORT != "$SS_INNER_PORT" && $VLESS_PORT != "$SS_INNER_PORT" ]]     || die "Port $SS_INNER_PORT is reserved for the loopback-only Shadowsocks backend; choose another VLESS/ShadowTLS port."
   check_target_is_safe
   install_prerequisites
   install_qrencode
@@ -786,17 +968,14 @@ main() {
   valid_host "$VPS_IP" || die 'Invalid --ip value.'
   # A forced replacement can safely reclaim ports from this service only. Other
   # software is still treated as a conflict by check_ports.
-  if [[ -e $CONFIG_FILE && $FORCE -eq 1 ]]; then systemctl stop sing-box 2>/dev/null || true; fi
+  # Complete WARP registration before touching an existing live service.
+  prepare_warp_profile
+  begin_force_rollback
   check_ports
   install_sing_box
-  prepare_warp_profile
   write_config
   write_service
-  open_firewall_if_active
-  enable_bbr
-  if systemctl list-unit-files fail2ban.service >/dev/null 2>&1; then
-    systemctl enable --now fail2ban >/dev/null 2>&1 || warn 'fail2ban could not be enabled (optional).'
-  fi
+
   # The upstream package may have started its own unit during an upgrade. Restart
   # after installing our unit so the checked, newly written configuration is the
   # one actually serving traffic.
@@ -806,6 +985,12 @@ main() {
   # started, so verify it remains alive before printing any credentials.
   sleep 2
   systemctl is-active --quiet sing-box || { journalctl -u sing-box -n 80 --no-pager; die 'sing-box did not start.'; }
+  commit_force_rollback
+
+  # Apply host-level tuning only after the checked configuration is serving.
+  open_firewall_if_active
+  enable_bbr
+  configure_fail2ban
   install_warp_health_monitor
   print_links
 }
@@ -814,7 +999,7 @@ case "$ACTION" in
   install) main "$@" ;;
   status) show_status ;;
   health-check) run_health_check ;;
+  export-client-profile) export_client_profile ;;
   upgrade-core) upgrade_core ;;
   *) die "Unknown action: $ACTION" ;;
 esac
-
