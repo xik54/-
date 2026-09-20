@@ -95,6 +95,8 @@ Shadowsocks 2022 只在回环地址的内部端口监听，公网 TCP 8443 由 S
 
 此选项代表你接受 Cloudflare WARP 条款。注册或连接失败发生在停止既有 sing-box 服务之前，因此失败不会覆盖已有节点。Cloudflare 仍可能返回 `429 Too Many Requests`；脚本不会循环重试。TCP 18080 由本地健康检查保留，TCP 40000 由 `warp-cli` 的回环 SOCKS5 保留；启用 WARP 时不要将 VLESS 或 ShadowTLS 配置为这两个端口。
 
+脚本会把 Cloudflare APT 签名密钥设为 `0644`，使 APT 的 `_apt` 验签用户可读取。若旧版脚本曾留下不可读的 Cloudflare 软件源密钥，新版在 `apt update` 前会先自动重建它；这要求系统已有 `curl`、`gpg` 与 `lsb_release`（旧版曾成功运行 WARP 安装的 VPS 已具备这些工具）。
+
 之后若以不带 `--with-warp-upstream` 的方式重装，sing-box 会停止使用 WARP 并移除健康检查，但脚本不会擅自断开或卸载现有 `warp-svc`，避免影响该 VPS 上的其它程序。若确认没有其它用途，再手动执行 `sudo warp-cli disconnect` 与 `sudo systemctl disable --now warp-svc`。
 
 启用后检查：

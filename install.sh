@@ -214,6 +214,39 @@ valid_port() {
   [[ $1 =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
 }
 
+configure_warp_apt_repository() {
+  local codename='' key_tmp=''
+  command -v curl >/dev/null || die 'curl is required to configure the Cloudflare WARP repository.'
+  command -v gpg >/dev/null || die 'gpg is required to configure the Cloudflare WARP repository.'
+  command -v lsb_release >/dev/null || die 'lsb_release is required to configure the Cloudflare WARP repository.'
+  codename="$(lsb_release -cs)"
+  [[ $codename =~ ^[a-z0-9]+$ ]] || die "Unsupported apt distribution codename: $codename"
+  key_tmp="$(mktemp)"
+  curl -fsSL --proto '=https' --tlsv1.2 https://pkg.cloudflareclient.com/pubkey.gpg -o "$key_tmp" \
+    || die 'Could not download the Cloudflare package signing key.'
+  gpg --yes --dearmor --output "$WARP_APT_KEYRING" "$key_tmp" \
+    || die 'Could not install the Cloudflare package signing key.'
+  # The installer uses umask 077, but apt verifies signatures as the _apt user.
+  # Keep this public signing key world-readable while all node credentials stay 0600.
+  chmod 644 "$WARP_APT_KEYRING" || die 'Could not make the Cloudflare package signing key readable by apt.'
+  rm -f "$key_tmp"
+  printf 'deb [signed-by=%s] https://pkg.cloudflareclient.com/ %s main\n' "$WARP_APT_KEYRING" "$codename" > "$WARP_APT_REPO"
+}
+
+repair_existing_warp_apt_repository() {
+  (( WITH_WARP_UPSTREAM )) || return 0
+  command -v apt-get >/dev/null || return 0
+  [[ -e $WARP_APT_REPO ]] || return 0
+  # An old installer could have created the key under umask 077. Repair it before
+  # the prerequisite apt-get update, otherwise apt would reject its own WARP repo.
+  if ! command -v curl >/dev/null || ! command -v gpg >/dev/null || ! command -v lsb_release >/dev/null; then
+    warn 'Existing Cloudflare WARP apt source was found but cannot be repaired before apt update because curl, gpg, or lsb_release is missing.'
+    return 0
+  fi
+  info 'Refreshing the existing Cloudflare WARP APT signing key before apt update'
+  configure_warp_apt_repository
+}
+
 install_prerequisites() {
   local pm=''
   if command -v apt-get >/dev/null; then pm=apt
@@ -314,7 +347,7 @@ install_qrencode() {
 }
 
 install_warp_cli() {
-  local pm='' codename='' key_tmp=''
+  local pm=''
   (( WITH_WARP_UPSTREAM )) || return 0
   if command -v warp-cli >/dev/null; then
     info "Using installed official warp-cli: $(warp-cli --version)"
@@ -330,17 +363,7 @@ install_warp_cli() {
   case "$pm" in
     apt)
       DEBIAN_FRONTEND=noninteractive apt-get install -y gpg lsb-release
-      command -v lsb_release >/dev/null || die 'lsb_release is required to configure the Cloudflare apt repository.'
-      codename="$(lsb_release -cs)"
-      [[ $codename =~ ^[a-z0-9]+$ ]] || die "Unsupported apt distribution codename: $codename"
-      key_tmp="$(mktemp)"
-      curl -fsSL --proto '=https' --tlsv1.2 https://pkg.cloudflareclient.com/pubkey.gpg -o "$key_tmp" || die 'Could not download the Cloudflare package signing key.'
-      gpg --yes --dearmor --output "$WARP_APT_KEYRING" "$key_tmp" || die 'Could not install the Cloudflare package signing key.'
-      # The installer uses umask 077, but apt verifies signatures as the _apt user.
-      # Keep this public signing key world-readable while all node credentials stay 0600.
-      chmod 644 "$WARP_APT_KEYRING" || die 'Could not make the Cloudflare package signing key readable by apt.'
-      rm -f "$key_tmp"
-      printf 'deb [signed-by=%s] https://pkg.cloudflareclient.com/ %s main\n' "$WARP_APT_KEYRING" "$codename" > "$WARP_APT_REPO"
+      configure_warp_apt_repository
       DEBIAN_FRONTEND=noninteractive apt-get update -y
       DEBIAN_FRONTEND=noninteractive apt-get install -y cloudflare-warp
       ;;
@@ -1025,6 +1048,7 @@ main() {
   [[ $SS_PORT != "$SS_INNER_PORT" && $VLESS_PORT != "$SS_INNER_PORT" ]]     || die "Port $SS_INNER_PORT is reserved for the loopback-only Shadowsocks backend; choose another VLESS/ShadowTLS port."
   validate_warp_reserved_ports
   check_target_is_safe
+  repair_existing_warp_apt_repository
   install_prerequisites
   install_qrencode
   if [[ -z $VPS_IP ]]; then VPS_IP="$(get_public_ip || true)"; fi
