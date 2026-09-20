@@ -336,6 +336,9 @@ install_warp_cli() {
       key_tmp="$(mktemp)"
       curl -fsSL --proto '=https' --tlsv1.2 https://pkg.cloudflareclient.com/pubkey.gpg -o "$key_tmp" || die 'Could not download the Cloudflare package signing key.'
       gpg --yes --dearmor --output "$WARP_APT_KEYRING" "$key_tmp" || die 'Could not install the Cloudflare package signing key.'
+      # The installer uses umask 077, but apt verifies signatures as the _apt user.
+      # Keep this public signing key world-readable while all node credentials stay 0600.
+      chmod 644 "$WARP_APT_KEYRING" || die 'Could not make the Cloudflare package signing key readable by apt.'
       rm -f "$key_tmp"
       printf 'deb [signed-by=%s] https://pkg.cloudflareclient.com/ %s main\n' "$WARP_APT_KEYRING" "$codename" > "$WARP_APT_REPO"
       DEBIAN_FRONTEND=noninteractive apt-get update -y
