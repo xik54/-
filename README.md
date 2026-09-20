@@ -4,7 +4,7 @@ install.sh 在 systemd Linux VPS 上安装当前稳定版 sing-box，并部署�
 
 | 入口 | 端口 | 客户端方式 |
 | --- | --- | --- |
-| VLESS + REALITY + XTLS Vision | TCP 443 | 导出完整 sing-box 国内外分流 JSON；同时输出 URI 供兼容客户端手动导入 |
+| VLESS + REALITY + XTLS Vision | TCP 443 | 导出完整 sing-box 国内外分流 JSON；同时输出 URI 和供 Shadowrocket 扫码导入的二维码 |
 | Hysteria2 + Salamander | UDP 443 | 输出兼容 Shadowrocket 的 hysteria2 URI 和二维码 |
 | ShadowTLS v3 + Shadowsocks 2022 | TCP 8443 | 导出专用 sing-box JSON；不输出无效的裸 ss URI/二维码 |
 
@@ -22,7 +22,7 @@ install.sh 在 systemd Linux VPS 上安装当前稳定版 sing-box，并部署�
 - UDP 443（Hysteria2）
 - TCP 8443（ShadowTLS + SS2022）
 
-如果系统正在运行 UFW 或 firewalld，脚本会仅添加这些端口；云厂商安全组仍需你自行开放。脚本会启用可用的 BBR，并安装 Fail2Ban 的 SSH 防暴力破解 jail（5 次失败 / 10 分钟，封禁 1 小时）。它不会把普通代理握手错误误判为端口扫描而自动封禁来源 IP。
+如果系统正在运行 UFW 或 firewalld，脚本会仅添加这些端口；云厂商安全组仍需你自行开放。脚本会启用可用的 BBR，并创建专用的 Fail2Ban SSH 防暴力破解 jail（5 次失败 / 10 分钟，封禁 1 小时）。它不会覆盖已有的 `sshd-local.conf`，也不会把普通代理握手错误误判为端口扫描而自动封禁来源 IP。
 
 若使用非默认端口：
 
@@ -52,7 +52,11 @@ VLESS 的 REALITY short_id 会随机生成并同时写入服务端、凭据和�
 
 导入到当前 sing-box 客户端并授予 VPN/TUN 权限。首次启动需要 VLESS 本身能连接，以下载远程规则集；如果报出 reality verification failed，优先核对 IP、SNI、UUID、公钥和 short_id 是否来自同一次安装。
 
-VLESS 不生成二维码：节点 URI 无法容纳整套分流、DNS 与规则集配置。脚本仍会在终端输出 VLESS URI，供支持 Reality URI 的其它客户端手动导入。
+脚本还会生成独立的 VLESS URI 二维码，供 Shadowrocket 等支持 Reality URI 的客户端扫码导入：
+
+    /etc/sing-box/qr/vless-reality.png
+
+该二维码只含节点连接参数，不能容纳整套分流、DNS 与规则集；要使用国内直连/国外代理规则，仍应导入上面的 sing-box JSON。
 
 ### Hysteria2
 
@@ -85,22 +89,23 @@ Shadowsocks 2022 只在回环地址的内部端口监听，公网 TCP 8443 由 S
 
 ## WARP 作为 VPS 出站
 
-可选 WARP 只作为 sing-box 内部的上游出口；不会创建 WireGuard 入站、wg0、新的 VPN 端口，也不会改变 VPS 默认路由或 SSH 管理流量：
+可选 WARP 使用 Cloudflare 官方 `cloudflare-warp` / `warp-cli`：脚本将客户端注册为一个 WARP 设备，设为 `proxy` 模式，并只开启 `127.0.0.1:40000` 的 SOCKS5 监听。sing-box 的最终代理流量转发到该本机端口；不会创建公开 VPN 入站端口，也不会改变 VPS 默认路由或 SSH 管理流量：
 
     sudo bash /tmp/sing-box-vps-installer.sh --ip YOUR_VPS_IP --with-warp-upstream
 
-首次免费注册依赖 Cloudflare 的服务。如果 wgcf 返回 429 Too Many Requests，安装会在停止已有 sing-box 服务之前退出；稍后再试，或导入你自己的 WARP 配置：
+此选项代表你接受 Cloudflare WARP 条款。注册或连接失败发生在停止既有 sing-box 服务之前，因此失败不会覆盖已有节点。Cloudflare 仍可能返回 `429 Too Many Requests`；脚本不会循环重试。TCP 18080 由本地健康检查保留，TCP 40000 由 `warp-cli` 的回环 SOCKS5 保留；启用 WARP 时不要将 VLESS 或 ShadowTLS 配置为这两个端口。
 
-    sudo bash /tmp/sing-box-vps-installer.sh       --ip YOUR_VPS_IP --with-warp-upstream       --warp-profile /root/wgcf-profile.conf
+之后若以不带 `--with-warp-upstream` 的方式重装，sing-box 会停止使用 WARP 并移除健康检查，但脚本不会擅自断开或卸载现有 `warp-svc`，避免影响该 VPS 上的其它程序。若确认没有其它用途，再手动执行 `sudo warp-cli disconnect` 与 `sudo systemctl disable --now warp-svc`。
 
-开启后可检查：
+启用后检查：
 
     sudo bash /tmp/sing-box-vps-installer.sh --status
     sudo bash /tmp/sing-box-vps-installer.sh --health-check
+    systemctl status warp-svc
+    warp-cli status
     journalctl -u sing-box-vps-health.service -n 50 --no-pager
 
-健康检查通过 loopback-only 的 127.0.0.1:18080 请求 Cloudflare trace，确认返回 warp=on 或 warp=plus。
-
+健康检查经 sing-box 的 loopback-only `127.0.0.1:18080` 再转发给 `warp-cli` SOCKS5，确认 Cloudflare trace 返回 `warp=on` 或 `warp=plus`。`warp-cli` 的注册状态由其自身管理；脚本会将 tunnel protocol 明确设为 MASQUE（当前 proxy mode 的要求），并且不再使用或导入 `wgcf-profile.conf`。
 ## 维护
 
 重新生成客户端 JSON，不改变服务器节点或凭据：
@@ -111,7 +116,9 @@ Shadowsocks 2022 只在回环地址的内部端口监听，公网 TCP 8443 由 S
 
     sudo bash /tmp/sing-box-vps-installer.sh --upgrade-core
 
-明确需要重新生成所有节点时，才使用 --force。脚本会制作时间戳备份；如果 --force 过程中下载、配置校验或启动失败，会恢复之前的配置、凭据与服务。
+明确需要重新生成所有节点时，才使用 --force。每次安装都会建立一个临时事务：首次安装若在配置校验或 sing-box 启动阶段失败，会移除未完成的配置、凭据和服务文件；--force 覆盖时则恢复原有的 sing-box 配置、凭据与 systemd 服务文件。软件包升级、WARP 注册、主机防火墙规则、BBR 与 Fail2Ban 属于系统级变更，不在自动回滚范围内。
+
+sing-box 通过官方签名软件源安装，不再执行 `curl | sh`。Arch Linux 不在脚本中刷新软件包数据库，以避免部分升级；若系统软件源已过期，应由管理员先自行执行完整的 `pacman -Syu`。
 
     sudo bash /tmp/sing-box-vps-installer.sh --force --ip YOUR_VPS_IP
 
@@ -122,7 +129,7 @@ Shadowsocks 2022 只在回环地址的内部端口监听，公网 TCP 8443 由 S
     sudo bash install.sh --ip VM_PUBLIC_IP
     sudo bash vm-smoke-test.sh
 
-烟雾测试为只读检查：验证服务、服务端配置、两份客户端 JSON、Hysteria2 二维码，以及 VLESS TCP、Hysteria2 UDP、ShadowTLS TCP 和内部 SS2022 TCP 监听。
+烟雾测试为只读检查：验证服务、服务端配置、两份客户端 JSON、VLESS 与 Hysteria2 二维码，以及 VLESS TCP、Hysteria2 UDP、ShadowTLS TCP 和内部 SS2022 TCP 监听。
 
     sudo bash vm-smoke-test.sh       --vless-port 2443 --hy2-port 2443 --ss-port 18443
 

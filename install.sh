@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # sing-box VPS installer -- systemd-based Debian/Ubuntu, RHEL-family, and Arch Linux.
-# Installs the current stable sing-box build from the upstream installer and creates
+# Installs the current stable sing-box build from official package sources and creates
 # VLESS+REALITY, Hysteria2+Salamander, and ShadowTLS v3 + Shadowsocks 2022 inbounds.
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -13,17 +13,19 @@ STATE_FILE="$CONFIG_DIR/credentials.env"
 SERVICE_FILE='/etc/systemd/system/sing-box.service'
 QR_DIR='/etc/sing-box/qr'
 CLIENT_DIR='/etc/sing-box/client-profiles'
-WARP_DIR='/etc/sing-box/warp'
 WARP_HEALTH_PORT=18080
+WARP_PROXY_PORT=40000
+WARP_APT_KEYRING='/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg'
+WARP_APT_REPO='/etc/apt/sources.list.d/cloudflare-client.list'
+SINGBOX_APT_KEYRING='/etc/apt/keyrings/sagernet.asc'
+SINGBOX_APT_REPO='/etc/apt/sources.list.d/sagernet.sources'
+SINGBOX_RPM_REPO='/etc/yum.repos.d/sing-box.repo'
+FAIL2BAN_JAIL_NAME='sing-box-vps-sshd'
+FAIL2BAN_JAIL_FILE="/etc/fail2ban/jail.d/$FAIL2BAN_JAIL_NAME.conf"
 HEALTHCHECK_FILE='/usr/local/sbin/sing-box-vps-healthcheck'
 HEALTH_SERVICE_FILE='/etc/systemd/system/sing-box-vps-health.service'
 HEALTH_TIMER_FILE='/etc/systemd/system/sing-box-vps-health.timer'
-WARP_PROFILE=''
 WITH_WARP_UPSTREAM=0
-# wgcf is an unaffiliated, open-source tool that creates a WireGuard profile for
-# the consumer WARP service. Keep this pinned; the download is checksum-verified.
-WGCF_VERSION='2.2.32'
-WGCF_BIN="$WARP_DIR/wgcf"
 VLESS_PORT=443
 HY2_PORT=443
 SS_PORT=8443
@@ -45,6 +47,8 @@ ROLLBACK_ENABLED=0
 ROLLBACK_CONFIG_BACKUP=''
 ROLLBACK_STATE_BACKUP=''
 ROLLBACK_SERVICE_BACKUP=''
+ROLLBACK_CONFIG_FILE_EXISTED=0
+ROLLBACK_STATE_FILE_EXISTED=0
 ROLLBACK_SERVICE_FILE_EXISTED=0
 
 color() { printf '\033[%sm%s\033[0m\n' "$1" "$2"; }
@@ -56,24 +60,38 @@ restore_previous_service_on_failure() {
   local exit_status=$?
   local backup_dir=''
   if (( exit_status != 0 && ROLLBACK_ENABLED )); then
-    warn 'Installation did not complete; restoring the prior sing-box configuration and service.'
-    if [[ -n $ROLLBACK_CONFIG_BACKUP && -f $ROLLBACK_CONFIG_BACKUP ]]; then
-      cp -af "$ROLLBACK_CONFIG_BACKUP" "$CONFIG_FILE" || warn 'Could not restore the prior sing-box configuration.'
-      backup_dir="$(dirname "$ROLLBACK_CONFIG_BACKUP")"
+    backup_dir="$(dirname "$ROLLBACK_CONFIG_BACKUP")"
+    if (( ROLLBACK_CONFIG_FILE_EXISTED )); then
+      warn 'Installation did not complete; restoring the prior sing-box configuration and service.'
+      [[ -f $ROLLBACK_CONFIG_BACKUP ]] \
+        && cp -af "$ROLLBACK_CONFIG_BACKUP" "$CONFIG_FILE" \
+        || warn 'Could not restore the prior sing-box configuration.'
+    else
+      warn 'Installation did not complete; removing the incomplete first-install configuration.'
+      rm -f "$CONFIG_FILE"
     fi
-    if [[ -n $ROLLBACK_STATE_BACKUP && -f $ROLLBACK_STATE_BACKUP ]]; then
-      cp -af "$ROLLBACK_STATE_BACKUP" "$STATE_FILE" || warn 'Could not restore the prior credentials file.'
+    if (( ROLLBACK_STATE_FILE_EXISTED )); then
+      [[ -f $ROLLBACK_STATE_BACKUP ]] \
+        && cp -af "$ROLLBACK_STATE_BACKUP" "$STATE_FILE" \
+        || warn 'Could not restore the prior credentials file.'
     else
       rm -f "$STATE_FILE"
     fi
-    if [[ -n $ROLLBACK_SERVICE_BACKUP && -f $ROLLBACK_SERVICE_BACKUP ]]; then
-      cp -af "$ROLLBACK_SERVICE_BACKUP" "$SERVICE_FILE" || warn 'Could not restore the prior sing-box service unit.'
-    elif (( ! ROLLBACK_SERVICE_FILE_EXISTED )); then
+    if (( ROLLBACK_SERVICE_FILE_EXISTED )); then
+      [[ -f $ROLLBACK_SERVICE_BACKUP ]] \
+        && cp -af "$ROLLBACK_SERVICE_BACKUP" "$SERVICE_FILE" \
+        || warn 'Could not restore the prior sing-box service unit.'
+    else
       rm -f "$SERVICE_FILE"
     fi
     systemctl daemon-reload || true
-    systemctl restart sing-box || warn 'Could not restart the prior sing-box service automatically.'
-    [[ -z $backup_dir ]] || { rm -f "$ROLLBACK_CONFIG_BACKUP" "$ROLLBACK_STATE_BACKUP" "$ROLLBACK_SERVICE_BACKUP"; rmdir "$backup_dir" 2>/dev/null || true; }
+    if (( ROLLBACK_CONFIG_FILE_EXISTED )); then
+      systemctl restart sing-box || warn 'Could not restart the prior sing-box service automatically.'
+    else
+      systemctl disable --now sing-box >/dev/null 2>&1 || true
+    fi
+    rm -f "$ROLLBACK_CONFIG_BACKUP" "$ROLLBACK_STATE_BACKUP" "$ROLLBACK_SERVICE_BACKUP"
+    rmdir "$backup_dir" 2>/dev/null || true
   fi
   trap - EXIT
   exit "$exit_status"
@@ -82,13 +100,25 @@ trap restore_previous_service_on_failure EXIT
 
 begin_force_rollback() {
   local backup_dir
-  [[ -e $CONFIG_FILE && $FORCE -eq 1 ]] || return 0
-  backup_dir="$(mktemp -d "$CONFIG_DIR/.rollback.XXXXXX")"
-  cp -a "$CONFIG_FILE" "$backup_dir/config.json"
-  if [[ -e $STATE_FILE ]]; then cp -a "$STATE_FILE" "$backup_dir/credentials.env"; fi
+  # check_target_is_safe has already required --force for any existing installer
+  # artifact. Keep a transaction even for a first install so a failed start does
+  # not leave a configuration that blocks the next normal run.
+  backup_dir="$(mktemp -d /tmp/sing-box-vps-rollback.XXXXXX)"
   ROLLBACK_CONFIG_BACKUP="$backup_dir/config.json"
   ROLLBACK_STATE_BACKUP="$backup_dir/credentials.env"
   ROLLBACK_SERVICE_BACKUP="$backup_dir/sing-box.service"
+  if [[ -e $CONFIG_FILE ]]; then
+    cp -a "$CONFIG_FILE" "$ROLLBACK_CONFIG_BACKUP"
+    ROLLBACK_CONFIG_FILE_EXISTED=1
+  else
+    ROLLBACK_CONFIG_FILE_EXISTED=0
+  fi
+  if [[ -e $STATE_FILE ]]; then
+    cp -a "$STATE_FILE" "$ROLLBACK_STATE_BACKUP"
+    ROLLBACK_STATE_FILE_EXISTED=1
+  else
+    ROLLBACK_STATE_FILE_EXISTED=0
+  fi
   if [[ -e $SERVICE_FILE ]]; then
     cp -a "$SERVICE_FILE" "$ROLLBACK_SERVICE_BACKUP"
     ROLLBACK_SERVICE_FILE_EXISTED=1
@@ -108,9 +138,9 @@ commit_force_rollback() {
   ROLLBACK_CONFIG_BACKUP=''
   ROLLBACK_STATE_BACKUP=''
   ROLLBACK_SERVICE_BACKUP=''
+  ROLLBACK_CONFIG_FILE_EXISTED=0
+  ROLLBACK_STATE_FILE_EXISTED=0
   ROLLBACK_SERVICE_FILE_EXISTED=0
-ROLLBACK_SERVICE_BACKUP=''
-ROLLBACK_SERVICE_FILE_EXISTED=0
 }
 usage() {
   cat <<'EOF'
@@ -127,10 +157,9 @@ Options:
   --hy2-obfs TYPE     Hysteria2 obfuscation: salamander (default) or gecko.
   --skip-singbox-update  Keep an already-installed sing-box binary; useful for offline testing only.
   --ss-port PORT      ShadowTLS v3 + Shadowsocks 2022 TCP port (default: 8443).
-  --with-warp-upstream  Route proxy clients through a WARP upstream on this VPS.
-                      This does not alter the VPS default route or SSH traffic.
-  --warp-profile PATH Import an existing WARP WireGuard profile instead of creating
-                      a free profile with wgcf. Implies --with-warp-upstream.
+  --with-warp-upstream  Route proxy clients through the official warp-cli WARP
+                      client in loopback-only SOCKS5 mode; this does not alter
+                      the VPS default route or SSH traffic.
   --upgrade-core       Update sing-box and restart it without replacing nodes or credentials.
   --status             Show service, configuration, and WARP monitor status.
   --health-check       Verify the configuration, service, and enabled WARP upstream.
@@ -141,7 +170,8 @@ Options:
 
 Requirements: a Linux VPS with a public address, root/sudo, outbound HTTPS access,
 and inbound TCP 443, UDP 443, and TCP 8443 permitted at the provider firewall.
-The optional WARP upstream also needs outbound UDP 2408; it is not an inbound port.
+The optional WARP upstream needs outbound access to Cloudflare; it opens only a
+loopback SOCKS5 listener on 127.0.0.1:40000, never an inbound public port.
 EOF
 }
 
@@ -158,7 +188,7 @@ while (($#)); do
     --skip-singbox-update) SKIP_SINGBOX_UPDATE=1; shift ;;
     --ss-port) [[ ${2:-} ]] || die '--ss-port needs a port'; SS_PORT="$2"; shift 2 ;;
     --with-warp-upstream|--with-warp) WITH_WARP_UPSTREAM=1; shift ;;
-    --warp-profile) [[ ${2:-} ]] || die '--warp-profile needs a path'; WARP_PROFILE="$2"; WITH_WARP_UPSTREAM=1; shift 2 ;;
+
     --upgrade-core) ACTION='upgrade-core'; shift ;;
     --status) ACTION='status'; shift ;;
     --health-check) ACTION='health-check'; shift ;;
@@ -197,7 +227,7 @@ install_prerequisites() {
     apt) DEBIAN_FRONTEND=noninteractive apt-get update -y; DEBIAN_FRONTEND=noninteractive apt-get install -y curl openssl ca-certificates iproute2 ;;
     dnf) dnf install -y curl openssl ca-certificates iproute ;;
     yum) yum install -y curl openssl ca-certificates iproute ;;
-    pacman) pacman -Sy --noconfirm curl openssl ca-certificates iproute2 ;;
+    pacman) pacman -S --needed --noconfirm curl openssl ca-certificates iproute2 ;;
   esac
   # Optional: do not make a deployment fail merely because a minimal distro has
   # no fail2ban package repository enabled.
@@ -219,17 +249,51 @@ get_public_ip() {
 }
 
 install_sing_box() {
-  if command -v sing-box >/dev/null; then
-    info "Updating existing sing-box to current stable: $(sing-box version | head -n1)"
-    if (( SKIP_SINGBOX_UPDATE )); then
-      warn 'Skipping sing-box update by request; this is intended only for an offline test or a controlled maintenance run.'
-      return
-    fi
-  else
-    info 'Installing the current stable sing-box release from the official upstream installer'
+  local pm=''
+  if (( SKIP_SINGBOX_UPDATE )); then
+    command -v sing-box >/dev/null || die '--skip-singbox-update requires an already-installed sing-box binary.'
+    warn 'Skipping sing-box update by request; this is intended only for an offline test or a controlled maintenance run.'
+    return
   fi
-  curl -fsSL --proto '=https' --tlsv1.2 https://sing-box.app/install.sh | sh
-  command -v sing-box >/dev/null || die 'The sing-box upstream installer completed but sing-box is not in PATH.'
+  if command -v sing-box >/dev/null; then
+    info "Updating sing-box from its official signed package source: $(sing-box version | head -n1)"
+  else
+    info 'Installing current stable sing-box from its official signed package source'
+  fi
+  if command -v apt-get >/dev/null; then pm='apt'
+  elif command -v dnf >/dev/null; then pm='dnf'
+  elif command -v yum >/dev/null; then pm='yum'
+  elif command -v pacman >/dev/null; then pm='pacman'
+  else die 'Supported package manager not found for sing-box.'; fi
+  case "$pm" in
+    apt)
+      install -d -m 755 /etc/apt/keyrings
+      curl -fsSL --proto '=https' --tlsv1.2 https://sing-box.app/gpg.key -o "$SINGBOX_APT_KEYRING" \
+        || die 'Could not download the official sing-box package signing key.'
+      chmod a+r "$SINGBOX_APT_KEYRING"
+      cat > "$SINGBOX_APT_REPO" <<EOF
+Types: deb
+URIs: https://deb.sagernet.org/
+Suites: *
+Components: *
+Enabled: yes
+Signed-By: $SINGBOX_APT_KEYRING
+EOF
+      DEBIAN_FRONTEND=noninteractive apt-get update -y
+      DEBIAN_FRONTEND=noninteractive apt-get install -y sing-box
+      ;;
+    dnf|yum)
+      curl -fsSL --proto '=https' --tlsv1.2 https://sing-box.app/sing-box.repo -o "$SINGBOX_RPM_REPO" \
+        || die 'Could not download the official sing-box RPM repository definition.'
+      "$pm" install -y sing-box
+      ;;
+    pacman)
+      # Do not use pacman -Sy here: refreshing databases without a full upgrade can
+      # leave an Arch host in a partial-upgrade state.
+      pacman -S --needed --noconfirm sing-box
+      ;;
+  esac
+  command -v sing-box >/dev/null || die 'sing-box package installation completed but sing-box is not in PATH.'
 }
 
 install_qrencode() {
@@ -245,116 +309,91 @@ install_qrencode() {
     apt) DEBIAN_FRONTEND=noninteractive apt-get install -y qrencode || warn 'qrencode installation failed; links will still be printed.' ;;
     dnf) dnf install -y qrencode || warn 'qrencode installation failed; links will still be printed.' ;;
     yum) yum install -y qrencode || warn 'qrencode installation failed; links will still be printed.' ;;
-    pacman) pacman -S --noconfirm qrencode || warn 'qrencode installation failed; links will still be printed.' ;;
+    pacman) pacman -S --needed --noconfirm qrencode || warn 'qrencode installation failed; links will still be printed.' ;;
   esac
 }
 
-install_wgcf() {
-  local arch asset base_url tmp_dir tmp_bin tmp_sums expected actual
-  [[ -x $WGCF_BIN ]] && return 0
-  case "$(uname -m)" in
-    x86_64|amd64) arch='amd64' ;;
-    aarch64|arm64) arch='arm64' ;;
-    *) die "WARP upstream only supports x86_64 and arm64 here; unsupported architecture: $(uname -m)" ;;
-  esac
-  asset="wgcf_${WGCF_VERSION}_linux_${arch}"
-  base_url="https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}"
-  tmp_dir="$(mktemp -d)"
-  tmp_bin="$tmp_dir/$asset"
-  tmp_sums="$tmp_dir/checksums.txt"
-  info "Downloading checksum-verified wgcf $WGCF_VERSION for the optional WARP upstream"
-  curl -fsSL --proto '=https' --tlsv1.2 -o "$tmp_bin" "$base_url/$asset" || die 'Could not download wgcf.'
-  curl -fsSL --proto '=https' --tlsv1.2 -o "$tmp_sums" "$base_url/checksums.txt" || die 'Could not download wgcf checksums.'
-  expected="$(awk -v name="$asset" '$2 == name {print $1; exit}' "$tmp_sums")"
-  [[ $expected =~ ^[a-fA-F0-9]{64}$ ]] || die 'Could not find the wgcf release checksum for this architecture.'
-  actual="$(sha256sum "$tmp_bin" | awk '{print $1}')"
-  [[ $actual == "$expected" ]] || die 'wgcf checksum verification failed; refusing to install it.'
-  install -d -m 700 "$WARP_DIR"
-  install -m 700 "$tmp_bin" "$WGCF_BIN"
-  rm -f "$tmp_bin" "$tmp_sums"
-  rmdir "$tmp_dir" 2>/dev/null || true
-}
-
-profile_values() {
-  local key="$2"
-  awk -v key="$key" '
-    $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
-      value=$0
-      sub(/^[^=]*=/, "", value)
-      sub(/^[[:space:]]+/, "", value)
-      sub(/[[:space:]]+$/, "", value)
-      sub(/\r$/, "", value)
-      print value
-    }
-  ' "$1"
-}
-
-valid_wg_key() {
-  [[ $1 =~ ^[A-Za-z0-9+/]{43}=$ ]]
-}
-
-prepare_warp_profile() {
-  local profile_path endpoint raw_reserved reserved_a reserved_b reserved_c
-  local -a addresses=()
+install_warp_cli() {
+  local pm='' codename='' key_tmp=''
   (( WITH_WARP_UPSTREAM )) || return 0
-  install -d -m 700 "$WARP_DIR"
-  profile_path="$WARP_DIR/wgcf-profile.conf"
-  if [[ -n $WARP_PROFILE ]]; then
-    [[ -r $WARP_PROFILE ]] || die 'The specified --warp-profile is not readable.'
-    if [[ $WARP_PROFILE != "$profile_path" ]]; then
-      if [[ -e $profile_path && $FORCE -ne 1 ]]; then
-        die "$profile_path already exists; use --force to replace the imported WARP profile."
-      fi
-      install -m 600 "$WARP_PROFILE" "$profile_path"
-    fi
-  elif [[ ! -s $profile_path ]]; then
-    install_wgcf
-    if [[ ! -s $WARP_DIR/wgcf-account.toml ]]; then
-      info 'Registering one free consumer WARP profile for the VPS upstream'
-      (cd "$WARP_DIR" && "$WGCF_BIN" register --accept-tos) || die 'wgcf could not register a WARP profile. Supply your own profile with --warp-profile PATH instead.'
-    else
-      info 'Reusing the existing WARP registration in /etc/sing-box/warp'
-    fi
-    (cd "$WARP_DIR" && "$WGCF_BIN" generate) || die 'wgcf could not generate a WARP WireGuard profile.'
-    chmod 600 "$WARP_DIR/wgcf-account.toml" "$profile_path"
+  if command -v warp-cli >/dev/null; then
+    info "Using installed official warp-cli: $(warp-cli --version)"
+    systemctl enable --now warp-svc
+    return
   fi
+  if command -v apt-get >/dev/null; then pm='apt'
+  elif command -v dnf >/dev/null; then pm='dnf'
+  elif command -v yum >/dev/null; then pm='yum'
+  else die 'Official Cloudflare WARP packages are supported here only on apt, dnf, or yum hosts.'; fi
 
-  WARP_PRIVATE_KEY="$(profile_values "$profile_path" 'PrivateKey' | head -n1)"
-  WARP_PEER_PUBLIC_KEY="$(profile_values "$profile_path" 'PublicKey' | head -n1)"
-  endpoint="$(profile_values "$profile_path" 'Endpoint' | head -n1)"
-  valid_wg_key "$WARP_PRIVATE_KEY" || die 'The WARP profile has an invalid Interface PrivateKey.'
-  valid_wg_key "$WARP_PEER_PUBLIC_KEY" || die 'The WARP profile has an invalid Peer PublicKey.'
-  if [[ $endpoint =~ ^\[([0-9A-Fa-f:.]+)\]:([0-9]+)$ ]]; then
-    WARP_PEER_ADDRESS="${BASH_REMATCH[1]}"; WARP_PEER_PORT="${BASH_REMATCH[2]}"
-  elif [[ $endpoint =~ ^([^:[:space:]]+):([0-9]+)$ ]]; then
-    WARP_PEER_ADDRESS="${BASH_REMATCH[1]}"; WARP_PEER_PORT="${BASH_REMATCH[2]}"
-  else
-    die 'The WARP profile Endpoint must be HOST:PORT.'
+  info "Installing official Cloudflare WARP client with $pm"
+  case "$pm" in
+    apt)
+      DEBIAN_FRONTEND=noninteractive apt-get install -y gpg lsb-release
+      command -v lsb_release >/dev/null || die 'lsb_release is required to configure the Cloudflare apt repository.'
+      codename="$(lsb_release -cs)"
+      [[ $codename =~ ^[a-z0-9]+$ ]] || die "Unsupported apt distribution codename: $codename"
+      key_tmp="$(mktemp)"
+      curl -fsSL --proto '=https' --tlsv1.2 https://pkg.cloudflareclient.com/pubkey.gpg -o "$key_tmp" || die 'Could not download the Cloudflare package signing key.'
+      gpg --yes --dearmor --output "$WARP_APT_KEYRING" "$key_tmp" || die 'Could not install the Cloudflare package signing key.'
+      rm -f "$key_tmp"
+      printf 'deb [signed-by=%s] https://pkg.cloudflareclient.com/ %s main\n' "$WARP_APT_KEYRING" "$codename" > "$WARP_APT_REPO"
+      DEBIAN_FRONTEND=noninteractive apt-get update -y
+      DEBIAN_FRONTEND=noninteractive apt-get install -y cloudflare-warp
+      ;;
+    dnf|yum)
+      curl -fsSL --proto '=https' --tlsv1.2 https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo -o /etc/yum.repos.d/cloudflare-warp.repo || die 'Could not download the Cloudflare WARP repository definition.'
+      "$pm" install -y cloudflare-warp
+      ;;
+  esac
+  command -v warp-cli >/dev/null || die 'cloudflare-warp installation completed but warp-cli is not in PATH.'
+  systemctl enable --now warp-svc
+}
+
+prepare_warp_cli() {
+  local trace='' attempt='' proxy_listener=''
+  (( WITH_WARP_UPSTREAM )) || return 0
+  # A pre-existing listener is safe only when it is the existing WARP daemon.
+  # Never point sing-box at an unrelated local process by mistake.
+  proxy_listener="$(ss -H -ltnp "sport = :$WARP_PROXY_PORT" 2>/dev/null || true)"
+  if [[ -n $proxy_listener && $proxy_listener != *'"warp-svc"'* ]]; then
+    die "TCP $WARP_PROXY_PORT is already owned by another process; it is reserved for warp-cli's loopback SOCKS5 listener."
   fi
-  valid_host "$WARP_PEER_ADDRESS" || die 'The WARP profile endpoint host is invalid.'
-  valid_port "$WARP_PEER_PORT" || die 'The WARP profile endpoint port is invalid.'
-  mapfile -t addresses < <(profile_values "$profile_path" 'Address')
-  WARP_ADDRESS_JSON=''
-  local address
-  for address in "${addresses[@]}"; do
-    [[ $address =~ ^[0-9A-Fa-f:.]+/[0-9]{1,3}$ ]] || die 'The WARP profile contains an invalid interface address.'
-    WARP_ADDRESS_JSON+="\"$address\","
+  install_warp_cli
+  systemctl is-active --quiet warp-svc || die 'warp-svc is not active after installation.'
+  if ! warp-cli registration show >/dev/null 2>&1; then
+    info 'Registering this VPS with the official Cloudflare WARP client'
+    warp-cli --accept-tos registration new || die 'warp-cli could not register this VPS with Cloudflare WARP. Existing sing-box service was not changed.'
+  else
+    info 'Reusing the existing official warp-cli registration on this VPS'
+  fi
+  warp-cli disconnect >/dev/null 2>&1 || true
+  warp-cli tunnel protocol set MASQUE || die 'Could not set the MASQUE tunnel protocol required by warp-cli proxy mode.'
+  warp-cli proxy port "$WARP_PROXY_PORT" || die 'Could not set the warp-cli loopback SOCKS5 port.'
+  warp-cli mode proxy || die 'Could not set warp-cli proxy mode.'
+  warp-cli connect || die 'Could not connect warp-cli.'
+  for ((attempt = 1; attempt <= 20; attempt++)); do
+    proxy_listener="$(ss -H -ltnp "sport = :$WARP_PROXY_PORT" 2>/dev/null || true)"
+    if [[ $proxy_listener == *'127.0.0.1:'* && $proxy_listener == *'"warp-svc"'* ]]; then break; fi
+    sleep 1
   done
-  WARP_ADDRESS_JSON="${WARP_ADDRESS_JSON%,}"
-  [[ -n $WARP_ADDRESS_JSON ]] || die 'The WARP profile does not contain an interface address.'
-  raw_reserved="$(profile_values "$profile_path" 'Reserved' | head -n1 || true)"
-  if [[ -z $raw_reserved ]]; then raw_reserved='0, 0, 0'; fi
-  IFS=',' read -r reserved_a reserved_b reserved_c <<<"$raw_reserved"
-  reserved_a="${reserved_a//[[:space:]]/}"; reserved_b="${reserved_b//[[:space:]]/}"; reserved_c="${reserved_c//[[:space:]]/}"
-  [[ $reserved_a =~ ^[0-9]+$ && $reserved_b =~ ^[0-9]+$ && $reserved_c =~ ^[0-9]+$ ]] || die 'The WARP profile Reserved value must contain three byte values.'
-  (( 10#$reserved_a <= 255 && 10#$reserved_b <= 255 && 10#$reserved_c <= 255 )) || die 'The WARP profile Reserved values must be 0-255.'
-  WARP_RESERVED="$reserved_a,$reserved_b,$reserved_c"
-  WARP_PROFILE="$profile_path"
+  [[ $proxy_listener == *'127.0.0.1:'* && $proxy_listener == *'"warp-svc"'* ]] \
+    || die "warp-cli did not open its loopback SOCKS5 listener on 127.0.0.1:$WARP_PROXY_PORT."
+  trace="$(curl -fsS --proxy "socks5h://127.0.0.1:$WARP_PROXY_PORT" --connect-timeout 8 --max-time 30 https://www.cloudflare.com/cdn-cgi/trace)" || die 'WARP connection test through the warp-cli SOCKS5 listener failed.'
+  printf '%s\n' "$trace" | grep -Eq '^warp=(on|plus)$' || die 'warp-cli connected but Cloudflare did not report an active WARP tunnel.'
+  info "Official warp-cli is connected in loopback-only SOCKS5 mode on 127.0.0.1:$WARP_PROXY_PORT."
+}
+validate_warp_reserved_ports() {
+  (( WITH_WARP_UPSTREAM )) || return 0
+  [[ $VLESS_PORT != "$WARP_HEALTH_PORT" && $SS_PORT != "$WARP_HEALTH_PORT" ]] \
+    || die "TCP $WARP_HEALTH_PORT is reserved for the loopback-only WARP health checker; choose another VLESS/ShadowTLS port."
+  [[ $VLESS_PORT != "$WARP_PROXY_PORT" && $SS_PORT != "$WARP_PROXY_PORT" ]] \
+    || die "TCP $WARP_PROXY_PORT is reserved for warp-cli's loopback SOCKS5 listener; choose another VLESS/ShadowTLS port."
 }
 
 check_target_is_safe() {
-  if [[ -e $CONFIG_FILE && $FORCE -ne 1 ]]; then
-    die "$CONFIG_FILE already exists. Nothing has been changed; re-run with --force only if you intend to replace it."
+  if (( FORCE != 1 )) && { [[ -e $CONFIG_FILE ]] || [[ -e $STATE_FILE ]] || [[ -e $SERVICE_FILE ]]; }; then
+    die 'Existing sing-box installer artifacts were found. Nothing has been changed; re-run with --force only if you intend to replace them.'
   fi
 }
 
@@ -405,21 +444,31 @@ EOF
 configure_fail2ban() {
   command -v fail2ban-client >/dev/null || { warn 'fail2ban is unavailable; SSH brute-force protection was not configured.'; return 0; }
   install -d -m 755 /etc/fail2ban/jail.d
-  cat > /etc/fail2ban/jail.d/sshd-local.conf <<'EOF'
-[sshd]
+  # Use a dedicated jail name. Never overwrite the common sshd-local.conf file,
+  # which may contain the VPS owner's existing SSH protection policy.
+  cat > "$FAIL2BAN_JAIL_FILE" <<EOF
+[$FAIL2BAN_JAIL_NAME]
 enabled = true
+filter = sshd
 backend = systemd
+port = ssh
 maxretry = 5
 findtime = 10m
 bantime = 1h
 EOF
-  systemctl enable --now fail2ban || warn 'fail2ban could not be started.'
-  fail2ban-client status sshd >/dev/null 2>&1 && info 'Fail2Ban SSH jail is active.' || warn 'Fail2Ban started but the SSH jail is unavailable.'
+  if systemctl is-active --quiet fail2ban; then
+    fail2ban-client reload || warn 'Fail2Ban is active but could not reload the dedicated SSH jail.'
+  else
+    systemctl enable --now fail2ban || warn 'fail2ban could not be started.'
+  fi
+  fail2ban-client status "$FAIL2BAN_JAIL_NAME" >/dev/null 2>&1 \
+    && info 'Dedicated Fail2Ban SSH jail is active.' \
+    || warn 'Fail2Ban is running but the dedicated SSH jail is unavailable.'
 }
 write_config() {
   local timestamp private_key public_key reality_pair candidate_file
   local uuid hy2_password hy2_obfs hy2_obfs_options ss_password shadowtls_password cert_path key_path reality_short_id
-  local warp_sections warp_health_inbound route_section
+  local warp_health_inbound route_section outbound_section warp_backend
   timestamp="$(date +%Y%m%d%H%M%S)"
   if [[ -e $CONFIG_FILE ]]; then
     cp -a "$CONFIG_FILE" "$CONFIG_FILE.backup-$timestamp"
@@ -461,39 +510,24 @@ write_config() {
   ss_password="$(openssl rand -base64 32 | tr -d '\n')"
   shadowtls_password="$(openssl rand -base64 24 | tr -d '\n')"
 
-  warp_sections=''
   warp_health_inbound=''
   route_section=''
+  outbound_section='{ "type": "direct", "tag": "direct" }'
+  warp_backend='none'
   if (( WITH_WARP_UPSTREAM )); then
-    # This is a userspace WireGuard endpoint owned by sing-box. It routes proxy
-    # traffic only; it does not install a host route or touch the SSH path.
-    warp_sections=$(cat <<EOF
-  "dns": {
-    "servers": [
-      { "type": "udp", "tag": "warp-bootstrap", "server": "1.1.1.1" }
-    ]
-  },
-  "endpoints": [
+    warp_backend='warp-cli-socks5'
+    # The official WARP client owns the tunnel. sing-box only sends proxy-client
+    # traffic to its loopback-only SOCKS5 listener, leaving host routes and SSH alone.
+    outbound_section=$(cat <<EOF
     {
-      "type": "wireguard", "tag": "warp", "system": false, "mtu": 1280,
-      "address": [$WARP_ADDRESS_JSON],
-      "private_key": "$WARP_PRIVATE_KEY",
-      "domain_resolver": "warp-bootstrap",
-      "peers": [
-        {
-          "address": "$WARP_PEER_ADDRESS", "port": $WARP_PEER_PORT,
-          "public_key": "$WARP_PEER_PUBLIC_KEY",
-          "allowed_ips": ["0.0.0.0/0", "::/0"],
-          "persistent_keepalive_interval": 25,
-          "reserved": [$WARP_RESERVED]
-        }
-      ]
-    }
-  ],
+      "type": "socks", "tag": "warp-cli",
+      "server": "127.0.0.1", "server_port": $WARP_PROXY_PORT, "version": "5"
+    },
+    { "type": "direct", "tag": "direct" }
 EOF
 )
     route_section=',
-  "route": { "final": "warp" }'
+  "route": { "final": "warp-cli" }'
     warp_health_inbound=$(cat <<EOF
     {
       "type": "mixed", "tag": "warp-health-local",
@@ -502,11 +536,10 @@ EOF
 EOF
 )
   fi
-
   cat > "$candidate_file" <<EOF
 {
   "log": { "level": "warn", "timestamp": true },
-$warp_sections
+
   "inbounds": [
 $warp_health_inbound
     {
@@ -564,7 +597,9 @@ $warp_health_inbound
       "password": "$ss_password"
     }
   ],
-  "outbounds": [{ "type": "direct", "tag": "direct" }]$route_section
+  "outbounds": [
+$outbound_section
+  ]$route_section
 }
 EOF
   chmod 600 "$candidate_file"
@@ -591,19 +626,32 @@ HY2_INSECURE='$HY2_INSECURE'
 SS2022_PASSWORD='$ss_password'
 SHADOWTLS_PASSWORD='$shadowtls_password'
 WARP_UPSTREAM_ENABLED='$WITH_WARP_UPSTREAM'
-WARP_PROFILE='$WARP_PROFILE'
+WARP_BACKEND='$warp_backend'
+WARP_PROXY_PORT='$WARP_PROXY_PORT'
 EOF
   chmod 600 "$STATE_FILE"
 }
 
 write_service() {
-  local sb_bin
+  local sb_bin unit_dependencies
   sb_bin="$(command -v sing-box)"
+  unit_dependencies=$(cat <<'EOF'
+After=network-online.target
+Wants=network-online.target
+EOF
+)
+  if (( WITH_WARP_UPSTREAM )); then
+    unit_dependencies=$(cat <<'EOF'
+After=network-online.target warp-svc.service
+Wants=network-online.target
+Requires=warp-svc.service
+EOF
+)
+  fi
   cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=sing-box universal proxy service
-After=network-online.target
-Wants=network-online.target
+$unit_dependencies
 
 [Service]
 Type=simple
@@ -618,18 +666,23 @@ WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
 }
-
 generate_qr_codes() {
-  local hy2_uri="$1"
-  command -v qrencode >/dev/null || { warn 'qrencode is unavailable; no Hysteria2 QR image was created.'; return 0; }
+  local vless_uri="$1" hy2_uri="$2"
+  command -v qrencode >/dev/null || { warn 'qrencode is unavailable; no VLESS or Hysteria2 QR images were created.'; return 0; }
   install -d -m 700 "$QR_DIR"
+  qrencode -l L -s 8 -o "$QR_DIR/vless-reality.png" "$vless_uri" || { warn 'Could not create VLESS REALITY QR image.'; return 0; }
   qrencode -l L -s 8 -o "$QR_DIR/hysteria2.png" "$hy2_uri" || { warn 'Could not create Hysteria2 QR image.'; return 0; }
-  chmod 600 "$QR_DIR/hysteria2.png"
+  chmod 600 "$QR_DIR/vless-reality.png" "$QR_DIR/hysteria2.png"
   cat <<EOF
+
+VLESS + REALITY QR PNG for Shadowrocket / URI clients (copy securely; it contains credentials):
+  $QR_DIR/vless-reality.png
 
 Hysteria2 QR PNG (copy securely; it contains credentials):
   $QR_DIR/hysteria2.png
 EOF
+  printf '\nTerminal QR: VLESS + REALITY\n'
+  qrencode -t ANSIUTF8 "$vless_uri" || warn 'Could not render terminal VLESS REALITY QR.'
   printf '\nTerminal QR: Hysteria2\n'
   qrencode -t ANSIUTF8 "$hy2_uri" || warn 'Could not render terminal Hysteria2 QR.'
 }
@@ -816,8 +869,9 @@ Installed and validated. Credentials were saved at: $STATE_FILE
 
 VLESS + REALITY (TCP $VLESS_PORT; Vision):
 $vless_uri
-Use $CLIENT_DIR/sing-box-vless-cn-bypass.json in sing-box. No VLESS QR is
-generated because a URL cannot carry the China-direct routing rules.
+Use $CLIENT_DIR/sing-box-vless-cn-bypass.json in sing-box for China-direct
+routing. The separate VLESS QR is for Shadowrocket / URI clients and does not
+contain the sing-box routing rules.
 
 Hysteria2 + $HY2_OBFS_TYPE (UDP $HY2_PORT):
 $hy2_uri
@@ -835,7 +889,7 @@ Operations:
   systemctl status sing-box
   journalctl -u sing-box -f
   sing-box check -c $CONFIG_FILE
-  sudo bash install.sh --export-client-profile
+  Re-run the same downloaded installer with --export-client-profile
 
 Important: provider-level firewalls/security groups are outside this VPS. Open
 TCP $VLESS_PORT, UDP $HY2_PORT, and TCP $SS_PORT there. Keep $STATE_FILE private.
@@ -843,14 +897,14 @@ EOF
   if (( WITH_WARP_UPSTREAM )); then
     cat <<EOF
 
-WARP upstream: enabled inside sing-box for proxy-client traffic only.
-The VPS host route and SSH path are unchanged. WARP credentials are root-only:
-  $WARP_PROFILE
-WARP is an upstream network service, so availability and the observed egress IP
-are controlled by Cloudflare and may change.
+WARP upstream: sing-box forwards proxy-client traffic to the official warp-cli
+loopback SOCKS5 listener at 127.0.0.1:$WARP_PROXY_PORT. The VPS host route and
+SSH path are unchanged. The warp-svc registration is managed by Cloudflare.
+WARP availability and the observed egress IP are controlled by Cloudflare and
+may change.
 EOF
   fi
-  generate_qr_codes "$hy2_uri"
+  generate_qr_codes "$vless_uri" "$hy2_uri"
 }
 export_client_profile() {
   [[ -r $STATE_FILE ]] || die "Credentials not found: $STATE_FILE"
@@ -903,7 +957,8 @@ EOF
   cat > "$HEALTH_SERVICE_FILE" <<'EOF'
 [Unit]
 Description=Check sing-box WARP upstream health
-After=sing-box.service
+After=sing-box.service warp-svc.service
+Requires=warp-svc.service
 
 [Service]
 Type=oneshot
@@ -932,7 +987,8 @@ show_status() {
   printf 'sing-box: %s\n' "$(sing-box version | head -n1)"
   printf 'service: %s\n' "$(systemctl is-active sing-box || true)"
   if warp_is_configured; then
-    printf 'WARP upstream: enabled\n'
+    printf 'WARP upstream: enabled through warp-cli SOCKS5 on 127.0.0.1:%s\n' "${WARP_PROXY_PORT:-40000}"
+    printf 'warp-svc: %s\n' "$(systemctl is-active warp-svc || true)"
     printf 'WARP monitor: %s\n' "$(systemctl is-active sing-box-vps-health.timer || true)"
     printf 'Run a live WARP test: sudo bash install.sh --health-check\n'
   else
@@ -964,6 +1020,7 @@ main() {
   fi
   [[ $SS_PORT != "$VLESS_PORT" && $SS_PORT != "$HY2_PORT" ]] || die 'The ShadowTLS port must differ from both VLESS and Hysteria2 ports.'
   [[ $SS_PORT != "$SS_INNER_PORT" && $VLESS_PORT != "$SS_INNER_PORT" ]]     || die "Port $SS_INNER_PORT is reserved for the loopback-only Shadowsocks backend; choose another VLESS/ShadowTLS port."
+  validate_warp_reserved_ports
   check_target_is_safe
   install_prerequisites
   install_qrencode
@@ -973,7 +1030,7 @@ main() {
   # A forced replacement can safely reclaim ports from this service only. Other
   # software is still treated as a conflict by check_ports.
   # Complete WARP registration before touching an existing live service.
-  prepare_warp_profile
+  prepare_warp_cli
   begin_force_rollback
   check_ports
   install_sing_box
@@ -985,8 +1042,8 @@ main() {
   # one actually serving traffic.
   systemctl enable sing-box
   systemctl restart sing-box
-  # A WireGuard endpoint may fail shortly after systemd reports the process as
-  # started, so verify it remains alive before printing any credentials.
+  # The configured upstream may fail shortly after systemd reports the process as
+  # started, so verify the service remains alive before printing any credentials.
   sleep 2
   systemctl is-active --quiet sing-box || { journalctl -u sing-box -n 80 --no-pager; die 'sing-box did not start.'; }
   commit_force_rollback

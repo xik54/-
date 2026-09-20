@@ -12,6 +12,7 @@ HY2_PORT=443
 SS_PORT=8443
 SS_INNER_PORT=8444
 WITH_WARP_UPSTREAM=0
+WARP_PROXY_PORT=40000
 
 while (($#)); do
   case "$1" in
@@ -47,13 +48,18 @@ for profile in "$CLIENT_DIR/sing-box-vless-cn-bypass.json" "$CLIENT_DIR/sing-box
   [[ -s $profile ]] || { echo "Missing client profile: $profile" >&2; exit 1; }
   sing-box check -c "$profile"
 done
-[[ -s "$QR_DIR/hysteria2.png" ]] || { echo 'Missing Hysteria2 QR PNG.' >&2; exit 1; }
+for qr_png in "$QR_DIR/vless-reality.png" "$QR_DIR/hysteria2.png"; do
+  [[ -s $qr_png ]] || { echo "Missing QR PNG: $qr_png" >&2; exit 1; }
+done
 
 if (( WITH_WARP_UPSTREAM )); then
   grep -q "^WARP_UPSTREAM_ENABLED='1'" "$STATE" || { echo 'WARP was requested but is not enabled in credentials.' >&2; exit 1; }
+  grep -q "^WARP_BACKEND='warp-cli-socks5'" "$STATE" || { echo 'WARP backend is not warp-cli SOCKS5.' >&2; exit 1; }
+  systemctl is-active --quiet warp-svc
+  ss -H -ltn "sport = :$WARP_PROXY_PORT" | grep -q '127.0.0.1' || { echo "Missing warp-cli loopback SOCKS5 listener on $WARP_PROXY_PORT." >&2; exit 1; }
   systemctl is-active --quiet sing-box-vps-health.timer
 fi
 
 echo "PASS: valid config and client profiles; active service; VLESS TCP $VLESS_PORT, Hysteria2 UDP $HY2_PORT, ShadowTLS TCP $SS_PORT, and loopback SS2022 TCP $SS_INNER_PORT are listening."
-(( WITH_WARP_UPSTREAM )) && echo 'PASS: the WARP health timer is active.'
+(( WITH_WARP_UPSTREAM )) && echo 'PASS: warp-svc, its loopback SOCKS5 listener, and the WARP health timer are active.'
 echo 'Next: use a client from a different network to test provider firewall reachability and live protocol connectivity.'
